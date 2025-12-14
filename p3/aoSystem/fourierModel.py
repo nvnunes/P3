@@ -211,7 +211,7 @@ class fourierModel:
                 raise ValueError('Error : the PSF field of view is too small to simulate the AO correction area\n')
                 
             # DEFINING THE NOISE AND ATMOSPHERE PSD
-            if self.ao.wfs.processing.noiseVar == [None]:
+            if len(self.ao.wfs.processing.noiseVar) == 0 or self.ao.wfs.processing.noiseVar[0] == None:
                 self.ao.wfs.processing.noiseVar = self.ao.wfs.NoiseVariance(self.ao.atm.r0 ,self.ao.atm.wvl)
             
             self.Wn   = np.mean(self.ao.wfs.processing.noiseVar)/(2*self.freq.kcMax_)**2
