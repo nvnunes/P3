@@ -1194,6 +1194,11 @@ def fwhm_1d(profile):
     # Points at the left and right edges of the region above the threshold
     left, right = indices[0], indices[-1]
     
+    if right-left >= profile.size-1:
+        print('fwhm_1d: not enough points below half height')
+        return profile.size  # Error: not enough points below half height
+                             # FWHM is the size of the profile
+
     # Interpolation to obtain a more precise estimate
     f = interp1d(profile[left-1:left+2], [left-1, left, left+1], kind='linear', bounds_error=False, fill_value="extrapolate")
     x1 = f(half_max)
