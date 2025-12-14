@@ -272,6 +272,8 @@ class aoSystem():
         else:
             if self.check_config_key('atmosphere','r0_value'):
                 r0 = self.get_config_value('atmosphere','r0_value') 
+            elif self.check_config_key('atmosphere','r0_Value'):
+                r0 = self.get_config_value('atmosphere','r0_Value') 
             else:
                 self.raiseMissingRequiredOpt('atmosphere','Seeing')
         
