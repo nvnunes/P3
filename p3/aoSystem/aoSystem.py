@@ -750,6 +750,9 @@ class aoSystem():
             else:
                 self.aoMode = 'SLAO'
     
+        if (len(opt_zen) == 0) or (len(opt_az) == 0) or (len(opt_w) == 0):
+            self.aoMode = 'MOAO'
+
         # %% ERROR BREAKDOWN
         if self.rtc.holoop['gain'] > 0:
             self.errorBreakdown()

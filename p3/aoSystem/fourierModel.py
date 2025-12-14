@@ -306,7 +306,14 @@ class fourierModel:
             # TOMOGRAPHIC SYSTEM
             self.Wtomo = self.tomographicReconstructor()
             self.Popt = self.optimalProjector()
-            self.W = np.matmul(self.Popt, self.Wtomo)
+            if self.ao.aoMode == 'MOAO':
+                self.W = np.zeros((self.Popt.shape[0], self.Popt.shape[1], self.Popt.shape[2], self.Wtomo.shape[3], self.Popt.shape[4]), dtype=complex)
+                for d_o in range(self.Popt.shape[4]):
+                    # Not clear why np.array is needed around self.Popt but if not included,
+                    # the product is slightly different than simulating each point separately
+                    self.W[:,:,:,:,d_o] = np.matmul(np.array(self.Popt[:,:,:,:,d_o]), self.Wtomo)
+            else:
+                self.W = np.matmul(self.Popt, self.Wtomo)
 
             # Computation of the Pbeta^DM matrix
             k = np.sqrt(self.freq.k2AO_)
@@ -346,7 +353,13 @@ class fourierModel:
                                                    *np.sinc(d_sub[g]*self.freq.kyAO_)\
                                                    *np.exp(i*2*np.pi*Hs[h]*(fx+fy))
 
-            self.Walpha = np.matmul(self.W,self.MPalphaL)
+            if self.ao.aoMode == 'MOAO':
+                self.Walpha = np.zeros((self.W.shape[0], self.W.shape[1], self.W.shape[2], self.MPalphaL.shape[3], self.W.shape[4]), dtype=complex)
+                for d_o in range(self.W.shape[4]):
+                    self.Walpha[:,:,:,:,d_o] = np.matmul(self.W[:,:,:,:,d_o], self.MPalphaL)
+            else:
+                self.Walpha = np.matmul(self.W,self.MPalphaL)
+
         self.t_finalReconstructor = 1000*(time.time() - tstart)
 
     def reconstructionFilter(self, MV=0):
@@ -455,7 +468,10 @@ class fourierModel:
         k = np.sqrt(self.freq.k2AO_)
         h_dm = self.ao.dms.heights
         nDm = len(h_dm)
-        nDir = len(self.ao.dms.opt_dir[0])
+        if self.ao.aoMode == 'MOAO':
+            nDir = self.ao.src.nSrc
+        else:
+            nDir = len(self.ao.dms.opt_dir[0])
         h_mod = self.atm_mod.heights * cpuArray(self.strechFactor_mod)
         nL = len(h_mod)
         nK = self.freq.resAO
@@ -463,8 +479,15 @@ class fourierModel:
 
         mat1 = np.zeros([nK, nK, nDm, nL], dtype=complex)
         to_inv = np.zeros([nK, nK, nDm, nDm], dtype=complex)
-        theta_x = self.ao.dms.opt_dir[0]/206264.8 * nnp.cos(self.ao.dms.opt_dir[1]*np.pi/180)
-        theta_y = self.ao.dms.opt_dir[0]/206264.8 * nnp.sin(self.ao.dms.opt_dir[1]*np.pi/180)
+        if self.ao.aoMode == 'MOAO':
+            theta_x = self.ao.src.zenith/206264.8 * nnp.cos(self.ao.src.azimuth*np.pi/180)
+            theta_y = self.ao.src.zenith/206264.8 * nnp.sin(self.ao.src.azimuth*np.pi/180)
+        else:
+            theta_x = self.ao.dms.opt_dir[0]/206264.8 * nnp.cos(self.ao.dms.opt_dir[1]*np.pi/180)
+            theta_y = self.ao.dms.opt_dir[0]/206264.8 * nnp.sin(self.ao.dms.opt_dir[1]*np.pi/180)
+
+        if self.ao.aoMode == 'MOAO':
+            Popt = np.zeros([nK, nK, nDm, nL, self.ao.src.nSrc], dtype=complex)
 
         for d_o in range(nDir):                 #loop on optimization directions
             Pdm = np.zeros([nK, nK, 1, nDm], dtype=complex)
@@ -478,12 +501,19 @@ class fourierModel:
             for l in range(nL):                 #loop on atmosphere layers
                 Pl[:, :, 0, l] = np.exp(i*2*np.pi*h_mod[l]*(fx + fy))
 
-            mat1 += np.matmul(Pdm_t, Pl)*self.ao.dms.opt_weights[d_o]
-            to_inv += np.matmul(Pdm_t, Pdm)*self.ao.dms.opt_weights[d_o]
+            if self.ao.aoMode == 'MOAO':
+                tmp_mat1 = np.matmul(Pdm_t, Pl)
+                tmp_to_inv = np.matmul(Pdm_t, Pdm)
+                tmp_mat2 = np.linalg.pinv(tmp_to_inv.astype(np.complex64),rcond=1/self.ao.dms.opt_cond)
+                Popt[:,:,:,:,d_o] = np.matmul(tmp_mat2, tmp_mat1)
+            else:
+                mat1 += np.matmul(Pdm_t, Pl)*self.ao.dms.opt_weights[d_o]
+                to_inv += np.matmul(Pdm_t, Pdm)*self.ao.dms.opt_weights[d_o]
 
         # Popt
-        mat2 = np.linalg.pinv(to_inv.astype(np.complex64),rcond=1/self.ao.dms.opt_cond)
-        Popt = np.matmul(mat2, mat1)
+        if self.ao.aoMode != 'MOAO':
+            mat2 = np.linalg.pinv(to_inv.astype(np.complex64),rcond=1/self.ao.dms.opt_cond)
+            Popt = np.matmul(mat2, mat1)
 
         self.t_opt = 1000*(time.time() - tstart)
         return Popt
@@ -805,7 +835,10 @@ class fourierModel:
                 psd = np.zeros((self.freq.resAO,self.freq.resAO,self.ao.src.nSrc),dtype=complex)
                 #where is the noise level ?
                 for j in range(self.ao.src.nSrc):
-                    PW = np.matmul(self.PbetaDM[j],self.W)
+                    if self.ao.aoMode == 'MOAO':
+                        PW = np.matmul(self.PbetaDM[j],self.W[:,:,:,:,j])
+                    else:
+                        PW = np.matmul(self.PbetaDM[j],self.W)
                     PW_t = np.conj(PW.transpose(0,1,3,2))
                     tmp = np.matmul(PW,np.matmul(self.Cb,PW_t))
                     psd[:,:,j] = self.freq.mskInAO_ * tmp[:, :, 0, 0]*self.freq.pistonFilterAO_
@@ -931,7 +964,10 @@ class fourierModel:
                     delta_h = Hs[j]*(fx+fy) - deltaT*self.ao.atm.wSpeed[j]*freq_t
                     PbetaL[: , :, 0, j] = np.exp(i*2*np.pi*delta_h)
 
-                proj = PbetaL - np.matmul(self.PbetaDM[s], self.Walpha)
+                if self.ao.aoMode == 'MOAO':
+                    proj = PbetaL - np.matmul(self.PbetaDM[s], self.Walpha[:,:,:,:,s])
+                else:
+                    proj = PbetaL - np.matmul(self.PbetaDM[s], self.Walpha)
                 proj_t = np.conj(proj.transpose(0, 1, 3, 2))
                 tmp = np.matmul(proj,np.matmul(self.Cphi, proj_t))
                 psd[:, :, s] = self.freq.mskInAO_ * tmp[:, :, 0, 0]*self.freq.pistonFilterAO_
