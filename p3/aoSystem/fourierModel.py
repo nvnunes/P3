@@ -502,6 +502,10 @@ class fourierModel:
             theta_y = self.ao.dms.opt_dir[0]/206264.8 * nnp.sin(self.ao.dms.opt_dir[1]*np.pi/180)
 
         if self.ao.aoMode == 'MOAO':
+            lambda_tikhonov = 1/self.ao.dms.opt_cond
+            identity_4d = np.eye(nDm)[np.newaxis, np.newaxis, :, :]          # (1, 1, nDm, nDm)
+            identity_4d = np.broadcast_to(identity_4d, (nK, nK, nDm, nDm))   # (nK, nK, nDm, nDm)
+            identity_4d = identity_4d.astype(np.complex64)
             Popt = np.zeros([nK, nK, nDm, nL, self.ao.src.nSrc], dtype=complex)
 
         for d_o in range(nDir):                 #loop on optimization directions
@@ -519,8 +523,13 @@ class fourierModel:
             if self.ao.aoMode == 'MOAO':
                 tmp_mat1 = np.matmul(Pdm_t, Pl)
                 tmp_to_inv = np.matmul(Pdm_t, Pdm)
-                tmp_mat2 = np.linalg.pinv(tmp_to_inv.astype(np.complex64),rcond=1/self.ao.dms.opt_cond)
-                Popt[:,:,:,:,d_o] = np.matmul(tmp_mat2, tmp_mat1)
+
+                # Tikhonov regularization
+                A = tmp_to_inv.astype(np.complex64) + lambda_tikhonov * identity_4d
+                b = tmp_mat1.astype(np.complex64)
+                tmp_mat2 = np.linalg.solve(A, b)
+
+                Popt[:,:,:,:,d_o] = tmp_mat2
             else:
                 mat1 += np.matmul(Pdm_t, Pl)*self.ao.dms.opt_weights[d_o]
                 to_inv += np.matmul(Pdm_t, Pdm)*self.ao.dms.opt_weights[d_o]
