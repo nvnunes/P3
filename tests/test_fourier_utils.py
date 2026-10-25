@@ -9,6 +9,7 @@ import numpy as np
 from p3.aoSystem.FourierUtils import (
     create_wavelength_vector,
     cropSupport,
+    fwhm_1d,
     getStaticOTF,
     interpolateSupport,
     normalizeImage,
@@ -18,6 +19,21 @@ from p3.aoSystem.FourierUtils import (
 
 
 class TestFourierUtils(unittest.TestCase):
+    def test_fwhm_boundary_profiles_return_the_available_width(self):
+        for values in ([1, .8, .2, .1, .2, .8, 1],
+                       [1, 1, .8, .2, .1], [.1, .2, .8, 1, 1]):
+            with self.subTest(profile=values):
+                profile = np.asarray(values, dtype=float)
+                self.assertEqual(fwhm_1d(profile), profile.size)
+
+    def test_fwhm_interior_crossings_are_unchanged(self):
+        profile = np.asarray([.1, .2, .8, 1, .8, .2, .1])
+        self.assertAlmostEqual(fwhm_1d(profile), 3.0)
+        x = np.arange(-20, 21)
+        gaussian = np.exp(-x**2 / (2 * 4.0**2))
+        self.assertAlmostEqual(fwhm_1d(gaussian), 2 * np.sqrt(2 * np.log(2)) * 4,
+                               delta=0.03)
+
     def test_crop_support_returns_centered_view(self):
         image = np.arange(25, dtype=np.float32).reshape(5, 5)
 

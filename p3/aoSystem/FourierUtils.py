@@ -1395,6 +1395,8 @@ def fwhm_1d(profile):
     
     # Points at the left and right edges of the region above the threshold
     left, right = indices[0], indices[-1]
+    if left == 0 or right == profile.size - 1:
+        return profile.size  # A half-height crossing lies outside the profile.
     
     # Interpolation to obtain a more precise estimate
     f = interp1d(profile[left-1:left+2], [left-1, left, left+1], kind='linear', bounds_error=False, fill_value="extrapolate")
