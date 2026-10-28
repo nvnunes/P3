@@ -72,7 +72,7 @@ class fourierModel:
                  MV=0, nyquistSampling=False, addOtfPixel=False, freq=None, ao=None,
                  computeFocalAnisoCov=True, TiltFilter=False, doComputations=True,
                  psdExpansion=False, psdPerWavelength=False,
-                 reduce_memory=False, config_dict=None):
+                 reduce_memory=False, config_dict=None, computeOpticalPSD=False):
         """
         Parameters
         ----------
@@ -141,6 +141,12 @@ class fourierModel:
         config_dict : dict, optional
             Parameter dictionary (same structure as the parameter file) used
             instead of reading ``path_ini``.
+        computeOpticalPSD : bool, optional
+            Also expose ``opticalPSD`` for finite-pupil covariance optics.
+            Main-residual and alias power omit their variance-only piston
+            factors there. ``PSD``, reconstruction and component error budgets
+            retain their existing conventions. No optical projection is done
+            here; the consumer supplies its pupil and tilt treatment.
         """
 
         tstart = time.time()
@@ -165,6 +171,8 @@ class fourierModel:
         self.getEnsquaredEnergy = getEnsquaredEnergy
         self.getEncircledEnergy = getEncircledEnergy
         self.reduce_memory = reduce_memory
+        self.computeOpticalPSD = computeOpticalPSD
+        self.opticalPSD = None
 
         if freq is not None:
             self.freq = freq
@@ -433,6 +441,7 @@ class fourierModel:
             saved_freq = self.freq
             multi_grid = len(self.freq.wvl_grids) > 1
             psd_list = []
+            optical_psd_list = []
             for grid_ctx in self.freq.wvl_grids:
                 # This is the crux of the per-wavelength PSD: every method
                 # below (spatialReconstructor, controller, powerSpectrumDensity
@@ -508,6 +517,8 @@ class fourierModel:
                 else:
                     wfe = None
                 psd_list.append(self.powerSpectrumDensity(wfe=wfe))
+                if self.computeOpticalPSD:
+                    optical_psd_list.append(self.opticalPSD)
             self.freq = saved_freq
 
             # Restore the leftover shared-reference state (noiseVar/atm.wvl/
@@ -532,6 +543,9 @@ class fourierModel:
                 )
 
             self.PSD = psd_list[0] if len(psd_list) == 1 else psd_list
+            if self.computeOpticalPSD:
+                self.opticalPSD = (optical_psd_list[0] if len(optical_psd_list) == 1
+                                   else optical_psd_list)
 
             # COMPUTE THE PSF
             if self.calcPSF:
@@ -1057,10 +1071,16 @@ class fourierModel:
             pf = FourierUtils.pistonFilter(self.ao.tel.D, k, dtype=self.dtype)
             psd = self.ao.atm.spectrum(k) * pf
             psd = psd[:, :, np.newaxis]
+            if self.computeOpticalPSD:
+                self.opticalPSD = (self.ao.atm.spectrum(k)*(k != 0))[:, :, np.newaxis] * (dk*rad2nm)**2
         else:
             # CLOSED-LOOP
             psd = np.zeros((self.freq.nOtf,self.freq.nOtf,self.ao.src.nSrc),
                            dtype=self.dtype)
+            optical_delta = None
+            if self.computeOpticalPSD:
+                optical_delta = np.zeros((self.freq.resAO, self.freq.resAO, self.ao.src.nSrc),
+                                         dtype=self.dtype)
 
             # AO correction area
             id1 = np.ceil(self.freq.nOtf/2 - self.freq.resAO/2).astype(int)
@@ -1080,6 +1100,9 @@ class fourierModel:
             # Aliasing
             self.psdAlias = np.real(self.aliasingPSD())
             psd[id1:id2,id1:id2,:] += self.psdAlias[:, :, np.newaxis]
+            if self.computeOpticalPSD:
+                optical_alias = np.real(self.aliasingPSD(piston_filter=False))
+                optical_delta += (optical_alias-self.psdAlias)[:, :, None]
 
             # --- free memory
             if self.reduce_memory and not self.getErrorBreakDown:
@@ -1102,8 +1125,12 @@ class fourierModel:
                 self.psdChromatism = None
 
             # Add the noise and spatioTemporal PSD
+            if self.computeOpticalPSD:
+                optical_main = np.real(self.spatioTemporalPSD(piston_filter=False))
             self.psdSpatioTemporal = np.real(self.spatioTemporalPSD())
             psd[id1:id2,id1:id2,:] += self.psdSpatioTemporal
+            if self.computeOpticalPSD:
+                optical_delta += optical_main-self.psdSpatioTemporal
 
             # --- free memory
             if self.reduce_memory and not self.getErrorBreakDown:
@@ -1136,7 +1163,10 @@ class fourierModel:
             # NORMALIZATION
             if wfe is not None:
                 psd *= (dk * rad2nm)**2
-                psd *= wfe**2/psd.sum()
+                normalization = wfe**2/psd.sum()
+                psd *= normalization
+                if self.computeOpticalPSD:
+                    optical_delta *= (dk*rad2nm)**2*normalization
 
             # Fitting
             self.psdFit = np.real(self.fittingPSD())
@@ -1160,6 +1190,8 @@ class fourierModel:
                 tiltFilter = self.TiltFilter()
                 for i in range(self.ao.src.nSrc):
                     psd[:,:,i] *= tiltFilter
+                if self.computeOpticalPSD:
+                    optical_delta *= tiltFilter[id1:id2, id1:id2, None]
 
             # Extra error
             if self.verbose:
@@ -1198,6 +1230,11 @@ class fourierModel:
                 self.k2AO_ = None
                 self.kc_ = None
                 self.kcAO_ = None
+
+            if self.computeOpticalPSD:
+                self.opticalPSD = psd.copy()
+                self.opticalPSD[id1:id2, id1:id2, :] += optical_delta
+                self.opticalPSD *= (dk*rad2nm)**2
 
         self.t_powerSpectrumDensity = 1000*(time.time() - tstart)
 
@@ -1325,7 +1362,7 @@ class fourierModel:
         self._aliasing_shift_cache = {}
         self._aliasing_shift_cache_signature = None
 
-    def _aliasing_psd_chunked(self, layer_chunk=5):
+    def _aliasing_psd_chunked(self, layer_chunk=5, piston_filter=True):
         d, T, td, vx, vy, weights, Rx, Ry, tf_flat, kxAO, kyAO, m_flat, n_flat = self._aliasing_common()
 
         terms = self._get_aliasing_shift_terms(
@@ -1333,7 +1370,7 @@ class fourierModel:
         )
         km = terms['km']
         kn = terms['kn']
-        PR = terms['PR']
+        PR = terms['PR'] if piston_filter else ((km != 0) | (kn != 0))
         W_mn = terms['W_mn']
         Q = terms['Q']
 
@@ -1358,7 +1395,8 @@ class fourierModel:
         psd = np.sum(PR * W_mn * np.abs(Q * avr_sum) ** 2, axis=0)
         return np.reshape(psd, self.Rx.shape)
 
-    def _aliasing_psd_streaming(self, shift_batch=8, layer_chunk=5, n_times_limit=None, use_precompute=True):
+    def _aliasing_psd_streaming(self, shift_batch=8, layer_chunk=5, n_times_limit=None, use_precompute=True,
+                              piston_filter=True):
         d, T, td, vx, vy, weights, Rx, Ry, tf_flat, kxAO, kyAO, m_flat, n_flat = self._aliasing_common()
 
         terms = None
@@ -1395,6 +1433,8 @@ class fourierModel:
                 W_mn = (km**2 + kn**2 + 1 / self.ao.atm.L0**2) ** (-11 / 6)
                 Q = (Rx[None, :] * km + Ry[None, :] * kn) * (np.sinc(d * km) * np.sinc(d * kn))
 
+            if not piston_filter:
+                PR = (km != 0) | (kn != 0)
             avr_sum = np.zeros((shift_end - shift_start, kxAO.size), dtype=self.complex_dtype)
             for layer_start in range(0, self.ao.atm.nL, layer_chunk):
                 layer_end = min(layer_start + layer_chunk, self.ao.atm.nL)
@@ -1414,7 +1454,8 @@ class fourierModel:
 
         return np.reshape(psd_vec, self.Rx.shape)
 
-    def aliasingPSD(self, method=None, shift_batch=8, layer_chunk=5, n_times_limit=None, use_precompute=True):
+    def aliasingPSD(self, method=None, shift_batch=8, layer_chunk=5, n_times_limit=None, use_precompute=True,
+                    piston_filter=True):
         """
         Aliasing error power spectrum density.
         Supported methods:
@@ -1428,7 +1469,7 @@ class fourierModel:
             method = 'chunked'
 
         if method == 'chunked':
-            psd = self._aliasing_psd_chunked(layer_chunk=layer_chunk)
+            psd = self._aliasing_psd_chunked(layer_chunk=layer_chunk, piston_filter=piston_filter)
         elif method == 'limited':
             if n_times_limit is None:
                 n_times_limit = max(1, int(self.freq.nTimes // 2))
@@ -1437,6 +1478,7 @@ class fourierModel:
                 layer_chunk=layer_chunk,
                 n_times_limit=n_times_limit,
                 use_precompute=use_precompute,
+                piston_filter=piston_filter,
             )
         else:
             psd = self._aliasing_psd_streaming(
@@ -1444,6 +1486,7 @@ class fourierModel:
                 layer_chunk=layer_chunk,
                 n_times_limit=None,
                 use_precompute=use_precompute,
+                piston_filter=piston_filter,
             )
 
         self.t_aliasingPSD = 1000 * (time.time() - tstart)
@@ -1576,7 +1619,7 @@ class fourierModel:
         self.t_windShakePSD = 1000*(time.time() - tstart)
         return self.freq.mskInAO_ * abs(psd)
 
-    def spatioTemporalPSD(self):
+    def spatioTemporalPSD(self, piston_filter=True):
         """%% Power spectrum density including reconstruction, field variations and temporal effects
         """
         tstart = time.time()
@@ -1597,7 +1640,13 @@ class fourierModel:
         wDir_x = np.cos(np.asarray(self.ao.atm.wDir) * np.pi / 180)
         wDir_y = np.sin(np.asarray(self.ao.atm.wDir) * np.pi / 180)
         wSpeed = np.asarray(self.ao.atm.wSpeed)
-        Watm = self.Wphi * self.freq.pistonFilterAO_
+        factor = self.freq.pistonFilterAO_ if piston_filter else (self.freq.k2AO_ != 0)
+        Watm = self.Wphi * factor
+        if self.nGs > 1:
+            covariance = self.Cphi
+            if not piston_filter:
+                pf = self.freq.pistonFilterAO_[..., None]
+                covariance = np.divide(self.Cphi, pf, out=np.zeros_like(self.Cphi), where=pf > 0)
         F = self.Rx*self.SxAv + self.Ry*self.SyAv
         two_pi_i = 2 * i * np.pi
 
@@ -1651,13 +1700,13 @@ class fourierModel:
                 # proj @ Cphi @ proj_T massively simplifies to element-wise broadcasting:
                 # Cphi is already piston-filtered (see tomographicReconstructor)
                 if self.sensedLayers.all():
-                    tmp = np.sum(np.abs(proj[:, :, 0, :])**2 * self.Cphi, axis=-1)
+                    tmp = np.sum(np.abs(proj[:, :, 0, :])**2 * covariance, axis=-1)
                 else:
                     sensed = np.asarray(nnp.where(self.sensedLayers)[0])
-                    tmp = np.sum(np.abs(proj[:, :, 0, sensed])**2 * self.Cphi[:, :, sensed], axis=-1) \
+                    tmp = np.sum(np.abs(proj[:, :, 0, sensed])**2 * covariance[:, :, sensed], axis=-1) \
                           + w_unsensed * self.Wphi
                 psd[:, :, s] = self.freq.mskInAO_ * tmp
-        if self.reduce_memory:
+        if self.reduce_memory and piston_filter:
             self.Walpha = None
         self.t_spatioTemporalPSD = 1000*(time.time() - tstart)
         return psd
