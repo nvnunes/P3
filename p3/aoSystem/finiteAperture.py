@@ -124,7 +124,7 @@ def validate_native(native):
     sensor = native.my_data_map.get('sensor_HO', {})
     native._validate_tomographic_aliasing()
     if native.temporalModel != 'polc' or native.exposureTime != 0:
-        raise ValueError('ReconstructionModel=finite_aperture currently requires scalar POLC and ExposureTime=0')
+        raise ValueError('ReconstructionModel=finite_aperture requires its model-owned POLC and instantaneous measurements')
     if np.any(native.ao.wfs.processing.noiseVar):
         raise ValueError('ReconstructionModel=finite_aperture has not been validated with nonzero HO noise')
     if sensor.get('TipTiltRemoval') != 'pupil_fit' or not native.computeOpticalPSD:

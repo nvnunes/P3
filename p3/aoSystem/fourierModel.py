@@ -23,7 +23,7 @@ from p3.aoSystem.atmosphere import atmosphere
 from p3.aoSystem.frequencyDomain import frequencyDomain
 from p3.aoSystem.airRefraction import MatharAirRefraction
 from p3.aoSystem.processing import is_auto_noise_var
-from p3.aoSystem.reconstruction import reconstruction_model
+from p3.aoSystem.reconstruction import reconstruction_model, MODEL_TEMPORAL_BEHAVIOUR
 
 #%% DISPLAY FEATURES
 mpl.rcParams['font.size'] = 16
@@ -60,13 +60,12 @@ class fourierModel:
     Fourier class gathering the PSD calculation for PSF reconstruction and
     fast analytic simulations.
 
-    ``[RTC] TemporalModel_HO`` defaults to ``'integrator'`` (existing P3
-    behaviour). ``'polc'`` selects a queued leaky pseudo-open-loop response for
-    tomographic ``alias_aware`` or ``finite_aperture`` models; their current
-    geometry requires equal-pitch SH WFSs and one ground-conjugate DM.
-    ``[sensor_HO] ExposureTime`` is a centered WFS integration duration in
-    seconds: zero is instantaneous; omitted/None uses detector clock/loop rate.
-    Explicit exposure currently supports multi-guide-star systems only.
+    ``[sensor_HO] ReconstructionModel`` owns temporal behaviour: ``standard``
+    retains existing integrator calculations and detector-derived measurement
+    averaging; ``alias_aware`` and ``finite_aperture`` use queued leaky POLC
+    and instantaneous measurements. Loop gain, rate and delay remain physical
+    controller inputs. The POLC models currently require multiple equal-pitch
+    SH WFSs and one ground-conjugate DM.
     """
 
     # Minimum tomographic regularization, relative to the largest diagonal
@@ -206,7 +205,8 @@ class fourierModel:
         self.dtype = self.ao.dtype
         self.complex_dtype = self.ao.complex_dtype
         self.my_data_map = self.ao.my_data_map
-        self.reconstructionModel = reconstruction_model(self.my_data_map.get('sensor_HO', {}))
+        self.reconstructionModel = reconstruction_model(
+            self.my_data_map.get('sensor_HO', {}), self.my_data_map.get('RTC', {}))
         self.finiteApertureReconstruction = self.reconstructionModel == 'finite_aperture'
         if self.finiteApertureReconstruction and calcPSF:
             raise ValueError("ReconstructionModel='finite_aperture' requires covariance optics through TIPTOP; use calcPSF=False in P3")
@@ -219,16 +219,7 @@ class fourierModel:
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not nnp.isfinite(value) or value < 0):
             raise ValueError('sensor_HO.TomographicRegularizationFloor must be a finite nonnegative fraction')
-        # The default preserves the existing integrator calculations.
-        self.temporalModel = self.my_data_map.get('RTC', {}).get('TemporalModel_HO', 'integrator')
-        if self.temporalModel not in ('integrator', 'polc'):
-            raise ValueError("RTC.TemporalModel_HO must be 'integrator' or 'polc'")
-        self.exposureTime = self.my_data_map.get('sensor_HO', {}).get('ExposureTime')
-        if self.exposureTime is not None:
-            value = self.exposureTime
-            if (isinstance(value, bool) or not isinstance(value, (int, float))
-                    or not nnp.isfinite(value) or value < 0):
-                raise ValueError('sensor_HO.ExposureTime must be nonnegative seconds or None')
+        self.temporalModel, self.exposureTime = MODEL_TEMPORAL_BEHAVIOUR[self.reconstructionModel]
         if self.temporalModel == 'polc':
             rtc = self.ao.rtc.holoop
             if (not nnp.isfinite(rtc['gain']) or not 0 <= rtc['gain'] <= 1
@@ -336,11 +327,7 @@ class fourierModel:
                 self.nGs = self.ao.ngs.nSrc
             self.wfsGridPhases = self._wfs_grid_phases()
             if self.temporalModel == 'polc':
-                if self.reconstructionModel == 'standard':
-                    raise ValueError("POLC currently requires ReconstructionModel='alias_aware' or 'finite_aperture'")
                 self._validate_tomographic_aliasing()
-            if self.exposureTime is not None and self.nGs < 2:
-                raise ValueError('ExposureTime currently requires multiple WFSs')
             if self.aliasAwareReconstruction:
                 self._validate_tomographic_aliasing()
             # Layers at or above a finite-altitude LGS are not sensed: they are

@@ -8,31 +8,29 @@ from test_p3_bugfixes_noise_tomo import _INI_TEMPLATE, _p3_path
 from p3.aoSystem.fourierModel import fourierModel
 
 
-def _model(path, temporal, noise, exposure=0., aware=True):
+def _model(path, noise, reconstruction='alias_aware'):
     path.mkdir(parents=True)
     c=ConfigParser();c.optionxform=str
     c.read_string(_INI_TEMPLATE.format(nph=[10000,15000,20000],noisevar=repr(noise)))
     c['sources_science'].update(Zenith='[0.,15.,30.]',Azimuth='[0.,45.,135.]')
-    c['sensor_HO'].update(ReconstructionModel=repr('alias_aware' if aware else 'standard'),
+    c['sensor_HO'].update(ReconstructionModel=repr(reconstruction),
         GridOffsets='[[-.23,-.23],[.23,-.23],[.23,.23]]',
-        ExposureTime=repr(exposure),TomographicRegularizationFloor='1e-6')
-    c['RTC']['TemporalModel_HO']=repr(temporal)
+        TomographicRegularizationFloor='1e-6')
     with (path/'system.ini').open('w') as f:c.write(f)
     return fourierModel(str(path/'system.ini'),path_root=_p3_path(),calcPSF=False,
         display=False,verbose=False,reduce_memory=False,computeFocalAnisoCov=False,
         computeOpticalPSD=True)
 
 
-@pytest.mark.parametrize('temporal',['integrator','polc'])
 @pytest.mark.parametrize('noise',[[.01,.02,.03],[0.,.02,.03],[None]])
-def test_noise_covariance_and_propagation_keep_both_axes(tmp_path,temporal,noise):
-    model=_model(tmp_path/'case',temporal,noise)
+def test_noise_covariance_and_propagation_keep_both_axes(tmp_path,noise):
+    model=_model(tmp_path/'case',noise)
+    assert model.temporalModel == 'polc' and model.exposureTime == 0.
     per_wfs=np.asarray(model.ao.wfs.processing.noiseVar)
     channels=np.repeat(per_wfs,2)
     np.testing.assert_array_equal(model._measurement_noise_variances(),channels)
     assert channels.shape==(2*model.nGs,)
-    gain=(model.noiseGain if temporal=='polc' else
-          min(.8,.4+.1333*model.ao.rtc.holoop['delay'])**2)
+    gain=model.noiseGain
     covariance=np.diag(channels)
     for source in range(model.ao.src.nSrc):
         command=model.PbetaDM[source] @ model.W
@@ -49,26 +47,24 @@ def test_noise_covariance_and_propagation_keep_both_axes(tmp_path,temporal,noise
         np.testing.assert_array_equal(getattr(plain,key),getattr(model,key))
 
 
-@pytest.mark.parametrize('temporal',['integrator','polc'])
-def test_embedding_combined_weights_preserves_noise_power(tmp_path,temporal):
-    scalar=_model(tmp_path/'scalar','integrator',[.01,.02,.03],aware=False)
-    scalar.temporalModel=temporal
-    scalar.controller()
-    xy=_model(tmp_path/'xy',temporal,[.01,.02,.03])
+def test_embedding_combined_weights_preserves_spatial_noise_power(tmp_path):
+    scalar=_model(tmp_path/'scalar',[.01,.02,.03],reconstruction='standard')
+    xy=_model(tmp_path/'xy',[.01,.02,.03])
     k=np.hypot(xy.freq.kxAO_,xy.freq.kyAO_)
     ux=np.divide(xy.freq.kxAO_,k,out=np.zeros_like(k),where=k>0)
     uy=np.divide(xy.freq.kyAO_,k,out=np.zeros_like(k),where=k>0)
     xy.W=np.stack((scalar.W*ux[...,None,None],scalar.W*uy[...,None,None]),axis=-1).reshape(
         *scalar.W.shape[:-1],2*scalar.nGs)
-    np.testing.assert_allclose(xy.noisePSD(),scalar.noisePSD(),rtol=3e-13,atol=1e-14)
+    scalar_gain=min(.8,.4+.1333*scalar.ao.rtc.holoop['delay'])**2
+    np.testing.assert_allclose(xy.noisePSD()/xy.noiseGain, scalar.noisePSD()/scalar_gain,
+                               rtol=3e-13,atol=1e-14)
 
 
-@pytest.mark.parametrize('temporal',['integrator','polc'])
-@pytest.mark.parametrize('exposure',[0.,.003])
 @pytest.mark.parametrize('piston',[False,True])
-def test_main_and_alias_power_match_independent_xy_cells(tmp_path,temporal,exposure,piston):
+def test_main_and_alias_power_match_independent_xy_cells(tmp_path,piston):
     from p3.aoSystem.FourierUtils import pistonFilter
-    model=_model(tmp_path/'case',temporal,[.01,.02,.03],exposure)
+    model=_model(tmp_path/'case',[.01,.02,.03])
+    temporal,exposure=model.temporalModel,model.exposureTime
     center=model.freq.resAO//2;ij=(center+2,center+1)
     k=np.array([model.freq.kxAO_[ij],model.freq.kyAO_[ij]])
     d=model.ao.wfs.optics[0].dsub

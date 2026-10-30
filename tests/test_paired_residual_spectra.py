@@ -3,10 +3,9 @@ import numpy as np
 import pytest
 from test_alias_aware_xy_propagation import _model
 
-@pytest.mark.parametrize('controller,aware', [('integrator', False), ('integrator', True), ('polc', True)])
-@pytest.mark.parametrize('exposure', [0., .001])
-def test_paired_spectra_equal_independent_calls(tmp_path, controller, aware, exposure):
-    model = _model(tmp_path/'model', controller, [.01, .02, .03], exposure, aware)
+@pytest.mark.parametrize('reconstruction', ['standard', 'alias_aware'])
+def test_paired_spectra_equal_independent_calls(tmp_path, reconstruction):
+    model = _model(tmp_path/'model', [.01, .02, .03], reconstruction=reconstruction)
     weights = model.W.copy()
     for method in (model._tomographic_aliasing_psd, model.spatioTemporalPSD):
         variance = method(piston_filter=True)
@@ -18,6 +17,6 @@ def test_paired_spectra_equal_independent_calls(tmp_path, controller, aware, exp
 
 @pytest.mark.parametrize('method', ['_tomographic_aliasing_psd', 'spatioTemporalPSD'])
 def test_paired_input_requires_reporting_spectrum(tmp_path, method):
-    model = _model(tmp_path/'model', 'polc', [0., 0., 0.])
+    model = _model(tmp_path/'model', [0., 0., 0.])
     with pytest.raises(ValueError, match='piston_filter=True'):
         getattr(model, method)(piston_filter=False, optical_pair=True)

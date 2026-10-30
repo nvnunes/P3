@@ -16,11 +16,10 @@ from test_p3_bugfixes_noise_tomo import _INI_TEMPLATE, _p3_path
 def small_model(path, option=None):
     config = ConfigParser(); config.optionxform = str
     config.read_string(_INI_TEMPLATE.format(nph=[1e4]*3, noisevar='[0.,0.,0.]'))
-    config['sensor_HO'].update(NumberLenslets='[4,4,4]', ExposureTime='0.0',
+    config['sensor_HO'].update(NumberLenslets='[4,4,4]',
         TipTiltRemoval="'pupil_fit'", TomographicRegularizationFloor='1e-6',
         GridOffsets='[[-.2,-.2],[.2,-.2],[.2,.2]]')
     config['DM'].update(NumberActuators='[8]', DmPitchs='[1.0]')
-    config['RTC']['TemporalModel_HO'] = repr('polc' if option else 'integrator')
     config['sensor_science']['PixelScale'] = repr(1.65e-6*(180/np.pi)*3600*1000/32)
     if option is not None:
         config['sensor_HO']['ReconstructionModel'] = repr('finite_aperture' if option else 'standard')

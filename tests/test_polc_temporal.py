@@ -9,15 +9,13 @@ from p3.aoSystem.fourierModel import fourierModel
 from test_p3_bugfixes_noise_tomo import _INI_TEMPLATE, _build
 
 
-def _case(tmp_path, temporal=None, exposure=None, noise='[0., 0., 0.]', extra=''):
+def _case(tmp_path, reconstruction='alias_aware', noise='[0., 0., 0.]', extra=''):
     tmp_path.mkdir(parents=True, exist_ok=True)
     text = _INI_TEMPLATE.format(nph=[10000]*3, noisevar=noise)
-    text = text.replace('[sensor_HO]', "[sensor_HO]\nReconstructionModel = 'alias_aware'\n"
-                        'GridOffsets = [[-.23,-.23],[.23,-.23],[.23,.23]]\n'+extra)
-    if temporal is not None:
-        text = text.replace('[RTC]', f'[RTC]\nTemporalModel_HO = {temporal!r}')
-    if exposure is not None:
-        text = text.replace('[sensor_HO]', f'[sensor_HO]\nExposureTime = {exposure}')
+    options = 'GridOffsets = [[-.23,-.23],[.23,-.23],[.23,.23]]\n'+extra
+    if reconstruction is not None:
+        options += f'\nReconstructionModel = {reconstruction!r}'
+    text = text.replace('[sensor_HO]', '[sensor_HO]\n'+options)
     path = tmp_path/'case.ini'
     path.write_text(text)
     return _build(str(path))
@@ -41,28 +39,17 @@ def test_response_matches_discrete_command_queue(gain, delay):
     np.testing.assert_allclose(model._polc_response(frequency), measured, atol=2e-12)
 
 
-def test_defaults_are_unchanged_and_spatial_weights_are_fixed(tmp_path):
-    default = _case(tmp_path/'default')
-    explicit = _case(tmp_path/'explicit', 'integrator', 'None')
-    polc = _case(tmp_path/'polc', 'polc', '0.0')
+def test_omitted_and_explicit_standard_keep_existing_timing(tmp_path):
+    default = _case(tmp_path/'default', reconstruction=None)
+    explicit = _case(tmp_path/'explicit', reconstruction='standard')
     np.testing.assert_array_equal(default.PSD, explicit.PSD)
-    for name in ('W', 'Wtomo', 'Popt', 'Cphi', 'Cphi_mod'):
-        np.testing.assert_array_equal(getattr(default, name), getattr(polc, name))
-    assert not np.array_equal(default.psdSpatioTemporal, polc.psdSpatioTemporal)
-    assert not np.array_equal(default.psdAlias, polc.psdAlias)
-
-
-def test_exposure_has_exact_sinc_response(tmp_path):
-    instant = _case(tmp_path/'instant', 'polc', '0.0')
-    averaged = _case(tmp_path/'averaged', 'polc', '0.003')
-    frequency = instant._layer_temporal_frequencies(instant.freq.kxAO_, instant.freq.kyAO_)
-    np.testing.assert_allclose(averaged.Walpha,
-        instant.Walpha*np.sinc(.003*frequency)[:, :, None, :], rtol=2e-13, atol=1e-14)
-    np.testing.assert_array_equal(instant.W, averaged.W)
+    for name in ('W', 'Wtomo', 'Popt', 'Cphi', 'Cphi_mod', 'psdAlias', 'psdNoise'):
+        np.testing.assert_array_equal(getattr(default, name), getattr(explicit, name))
+    assert default.temporalModel == 'integrator' and default.exposureTime is None
 
 
 def test_polc_gain_and_zero_wind_limits(tmp_path):
-    model = _case(tmp_path, 'polc', '0.0')
+    model = _case(tmp_path)
     frozen_weights = model.W.copy()
     model.ao.atm.wSpeed[:] = 0
     powers = []
@@ -82,7 +69,7 @@ def test_polc_gain_and_zero_wind_limits(tmp_path):
 
 @pytest.mark.parametrize('noise', ['[0.1, 0.2, 0.3]', '[0., 0.2, 0.3]'])
 def test_noise_gain_matches_independent_impulse_energy(tmp_path, noise):
-    model = _case(tmp_path, 'polc', '0.0', noise=noise)
+    model = _case(tmp_path, noise=noise)
     # Sum the squared impulse response of u[n]=(1-g)u[n-1]+g*noise[n].
     gains = (.1, .3, .9, 1.)
     powers = []
@@ -99,11 +86,11 @@ def test_noise_gain_matches_independent_impulse_energy(tmp_path, noise):
     np.testing.assert_array_equal(model.noisePSD(), 0.)
 
 
-@pytest.mark.parametrize('exposure', [0., .003])
-def test_alias_power_matches_independent_cell_and_time_integration(tmp_path, exposure):
+def test_alias_power_matches_independent_cell_and_time_integration(tmp_path):
     from p3.aoSystem.FourierUtils import pistonFilter
 
-    model = _case(tmp_path, 'polc', str(exposure))
+    model = _case(tmp_path)
+    exposure = 0.0
     row, col = model.freq.resAO//2+2, model.freq.resAO//2+1
     k = np.array([model.freq.kxAO_[row, col], model.freq.kyAO_[row, col]])
     unit = k/np.linalg.norm(k)
@@ -146,22 +133,15 @@ def test_alias_power_matches_independent_cell_and_time_integration(tmp_path, exp
     np.testing.assert_allclose(model.psdAlias[row, col], total, rtol=2e-12, atol=1e-14)
 
 
-@pytest.mark.parametrize('temporal,exposure,extra,match', [
-    ('other', None, '', 'TemporalModel_HO'),
-    ('polc', '-1', '', 'ExposureTime'),
-    ('polc', 'True', '', 'ExposureTime'),
-    ('polc', "'instantaneous'", '', 'ExposureTime'),
-    ('polc', '0.0', "ReconstructionModel = 'standard'", 'ReconstructionModel'),
+@pytest.mark.parametrize('section,key,value', [
+    ('RTC', 'TemporalModel_HO', "'polc'"),
+    ('RTC', 'TemporalModel_HO', "'integrator'"),
+    ('sensor_HO', 'ExposureTime', '0.0'),
+    ('sensor_HO', 'ExposureTime', 'None'),
 ])
-def test_invalid_configuration_is_rejected(tmp_path, temporal, exposure, extra, match):
-    # Avoid duplicate-key parsing when exercising the disabled-alias contract.
-    if extra:
-        text = _INI_TEMPLATE.format(nph=[10000]*3, noisevar='[0., 0., 0.]')
-        text = text.replace('[RTC]', "[RTC]\nTemporalModel_HO = 'polc'")
-        path = tmp_path/'invalid.ini'
-        path.write_text(text)
-        with pytest.raises(ValueError, match=match):
-            _build(str(path))
-    else:
-        with pytest.raises(ValueError, match=match):
-            _case(tmp_path, temporal, exposure)
+def test_actual_config_rejects_retired_temporal_options(tmp_path, section, key, value):
+    text = _INI_TEMPLATE.format(nph=[10000]*3, noisevar='[0.,0.,0.]')
+    text = text.replace('['+section+']', '['+section+']\n'+key+' = '+value)
+    path = tmp_path/'invalid.ini'; path.write_text(text)
+    with pytest.raises(ValueError, match='Remove these keys. ReconstructionModel owns'):
+        _build(str(path))
