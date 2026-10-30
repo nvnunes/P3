@@ -769,19 +769,24 @@ class fourierModel:
         response = np.zeros(qx.shape+(2*self.nGs, len(heights)), dtype=self.complex_dtype)
         offsets = np.asarray(self.my_data_map.get('sensor_HO', {}).get(
             'GridOffsets', [[0., 0.]]*self.nGs), dtype=self.dtype)
+        gradients = {}
+        durations = [self._wfs_exposure_time(g) for g in range(self.nGs)] if exposure else None
+        frequencies = (self._layer_temporal_frequencies(qx, qy)
+                       if exposure and any(duration > 0 for duration in durations) else None)
         for guide in range(self.nGs):
             pitch = self.ao.wfs.optics[guide].dsub
-            gx = self._scalar_wfs_gradient(qx, qy, 1., 0., pitch)
-            gy = self._scalar_wfs_gradient(qx, qy, 0., 1., pitch)
+            if pitch not in gradients:
+                gradients[pitch] = (self._scalar_wfs_gradient(qx, qy, 1., 0., pitch),
+                                    self._scalar_wfs_gradient(qx, qy, 0., 1., pitch))
+            gx, gy = gradients[pitch]
             shift = pitch*(qx*offsets[guide, 0]+qy*offsets[guide, 1])
             angle = qx*self.gs.direction[0, guide]+qy*self.gs.direction[1, guide]
             for layer, height in enumerate(heights):
                 if not sensed[layer]:
                     continue
                 factor = np.exp(2j*np.pi*(shift+height*angle))
-                if exposure:
-                    frequency = self._layer_temporal_frequencies(qx, qy)[..., layer]
-                    factor *= np.sinc(self._wfs_exposure_time(guide)*frequency)
+                if frequencies is not None and durations[guide] > 0:
+                    factor *= np.sinc(durations[guide]*frequencies[..., layer])
                 response[..., 2*guide, layer] = gx*factor
                 response[..., 2*guide+1, layer] = gy*factor
         return response
@@ -839,32 +844,34 @@ class fourierModel:
                 self.PbetaDM.append(PbetaDM)
 
             # Computation of the Malpha matrix
-            wDir_x = nnp.cos(self.ao.atm.wDir*np.pi/180)
-            wDir_y = nnp.sin(self.ao.atm.wDir*np.pi/180)
-            self.MPalphaL = np.zeros([nK, nK, self.nGs, nH],
-                                     dtype=self.complex_dtype)
-            for h in range(nH):
-                # unsensed layers: zero WFS response -> full residual in spatioTemporalPSD
-                if not self.sensedLayers[h]:
-                    continue
-                freq_t = wDir_x[h]*self.freq.kxAO_ + wDir_y[h]*self.freq.kyAO_
-                for g in range(self.nGs):
-                    Alpha = [self.gs.direction[0, g],self.gs.direction[1, g]]
-                    fx = Alpha[0]*self.freq.kxAO_
-                    fy = Alpha[1]*self.freq.kyAO_
-                    duration = (sampTime*clock_rate[g] if self.exposureTime is None
-                                else self.exposureTime)
-                    www = 2*i*np.pi*k * np.sinc(duration*self.ao.atm.wSpeed[h]*freq_t)
-                    self.MPalphaL[:, :, g, h] = www*np.sinc(d_sub[g]*self.freq.kxAO_)\
-                                                   *np.sinc(d_sub[g]*self.freq.kyAO_)\
-                                                   *np.exp(i*2*np.pi*Hs[h]*(fx+fy))
-            fx = None
-            fy = None
-            if self.wfsGridPhases is not None:
-                self.MPalphaL *= self.wfsGridPhases[..., None]
             if self.aliasAwareReconstruction:
                 self.MPalphaL = self._wfs_xy_measurement(
                     self.freq.kxAO_, self.freq.kyAO_, Hs, self.sensedLayers, exposure=True)
+            else:
+                wDir_x = nnp.cos(self.ao.atm.wDir*np.pi/180)
+                wDir_y = nnp.sin(self.ao.atm.wDir*np.pi/180)
+                self.MPalphaL = np.zeros([nK, nK, self.nGs, nH],
+                                         dtype=self.complex_dtype)
+                for h in range(nH):
+                    # unsensed layers: zero WFS response -> full residual in spatioTemporalPSD
+                    if not self.sensedLayers[h]:
+                        continue
+                    freq_t = wDir_x[h]*self.freq.kxAO_ + wDir_y[h]*self.freq.kyAO_
+                    for g in range(self.nGs):
+                        Alpha = [self.gs.direction[0, g],self.gs.direction[1, g]]
+                        fx = Alpha[0]*self.freq.kxAO_
+                        fy = Alpha[1]*self.freq.kyAO_
+                        duration = (sampTime*clock_rate[g] if self.exposureTime is None
+                                    else self.exposureTime)
+                        www = 2*i*np.pi*k * np.sinc(duration*self.ao.atm.wSpeed[h]*freq_t)
+                        self.MPalphaL[:, :, g, h] = www*np.sinc(d_sub[g]*self.freq.kxAO_)\
+                                                       *np.sinc(d_sub[g]*self.freq.kyAO_)\
+                                                       *np.exp(i*2*np.pi*Hs[h]*(fx+fy))
+                fx = None
+                fy = None
+                if self.wfsGridPhases is not None:
+                    self.MPalphaL *= self.wfsGridPhases[..., None]
+
             self.Walpha = np.matmul(self.W,self.MPalphaL)
         if self.reduce_memory:
             self.MPalphaL = None
@@ -942,22 +949,22 @@ class fourierModel:
 
         # 1. WFS operator and projection matrices
         # Calculate MP directly via broadcasting, avoiding the dense M matrix allocation
-        MP = np.zeros([nK, nK, nGs, nL_mod], dtype=self.complex_dtype)
-        for j in range(nGs):
-            M_diag_j = 2*i*np.pi*k * np.sinc(d[j]*self.freq.kxAO_) * np.sinc(d[j]*self.freq.kyAO_)
-            for n in range(nL_mod):
-                if not sensed_mod[n]:
-                    continue
-                P_jn = np.exp(i*2*np.pi*h_mod[n]*(self.freq.kxAO_*self.gs.direction[0, j] \
-                     + self.freq.kyAO_*self.gs.direction[1, j]))
-                MP[:, :, j, n] = M_diag_j * P_jn
-
-        if self.wfsGridPhases is not None:
-            MP *= self.wfsGridPhases[..., None]
-
         if self.aliasAwareReconstruction:
             MP = self._wfs_xy_measurement(
                 self.freq.kxAO_, self.freq.kyAO_, h_mod, sensed_mod)
+        else:
+            MP = np.zeros([nK, nK, nGs, nL_mod], dtype=self.complex_dtype)
+            for j in range(nGs):
+                M_diag_j = 2*i*np.pi*k * np.sinc(d[j]*self.freq.kxAO_) * np.sinc(d[j]*self.freq.kyAO_)
+                for n in range(nL_mod):
+                    if not sensed_mod[n]:
+                        continue
+                    P_jn = np.exp(i*2*np.pi*h_mod[n]*(self.freq.kxAO_*self.gs.direction[0, j] \
+                         + self.freq.kyAO_*self.gs.direction[1, j]))
+                    MP[:, :, j, n] = M_diag_j * P_jn
+
+            if self.wfsGridPhases is not None:
+                MP *= self.wfsGridPhases[..., None]
 
         # 2. Atmospheric PSD (Diagonal with respect to the layers)
         atm_weights = np.asarray(self.ao.atm.weights, dtype=self.dtype)
@@ -1294,10 +1301,18 @@ class fourierModel:
                 self.Cphi_mod = None
 
             # Aliasing
-            self.psdAlias = np.real(self.aliasingPSD())
+            if self.computeOpticalPSD and self.tomographicAliasing:
+                started = time.time()
+                alias, optical_alias = self._tomographic_aliasing_psd(optical_pair=True)
+                self.psdAlias = np.real(alias)
+                optical_alias = np.real(optical_alias)
+                self.t_aliasingPSD = 1000*(time.time() - started)
+            else:
+                self.psdAlias = np.real(self.aliasingPSD())
+                if self.computeOpticalPSD:
+                    optical_alias = np.real(self.aliasingPSD(piston_filter=False))
             psd[id1:id2,id1:id2,:] += self.psdAlias[:, :, np.newaxis]
             if self.computeOpticalPSD:
-                optical_alias = np.real(self.aliasingPSD(piston_filter=False))
                 optical_delta += (optical_alias-self.psdAlias)[:, :, None]
 
             # --- free memory
@@ -1321,9 +1336,14 @@ class fourierModel:
                 self.psdChromatism = None
 
             # Add the noise and spatioTemporal PSD
-            if self.computeOpticalPSD:
-                optical_main = np.real(self.spatioTemporalPSD(piston_filter=False))
-            self.psdSpatioTemporal = np.real(self.spatioTemporalPSD())
+            if self.computeOpticalPSD and self.nGs > 1:
+                main, optical_main = self.spatioTemporalPSD(optical_pair=True)
+                self.psdSpatioTemporal = np.real(main)
+                optical_main = np.real(optical_main)
+            else:
+                if self.computeOpticalPSD:
+                    optical_main = np.real(self.spatioTemporalPSD(piston_filter=False))
+                self.psdSpatioTemporal = np.real(self.spatioTemporalPSD())
             psd[id1:id2,id1:id2,:] += self.psdSpatioTemporal
             if self.computeOpticalPSD:
                 optical_delta += optical_main-self.psdSpatioTemporal
@@ -1692,7 +1712,7 @@ class fourierModel:
                 covariance += (response*layer_power[:,:,None,:]) @ np.conj(response.swapaxes(-1,-2))
         return covariance
 
-    def _tomographic_aliasing_psd(self, piston_filter=True):
+    def _tomographic_aliasing_psd(self, piston_filter=True, optical_pair=False):
         """Propagate aliases through the configured tomographic estimator.
 
         Alias-aware reconstruction retains both x/y slope channels; otherwise
@@ -1703,8 +1723,12 @@ class fourierModel:
         before squaring, without averaging independent layer amplitudes. Layers
         are independent, while each layer's alias is shared among guide stars.
         Currently supports equal SH pitches and one ground-conjugate DM.
+        With optical_pair, return (variance, optical) spectra from the same
+        commands, retaining each input-power factor and summation order.
         """
         self._validate_tomographic_aliasing()
+        if optical_pair and not piston_filter:
+            raise ValueError('Paired spectra require piston_filter=True')
         d, T, td, vx, vy, weights, _, _, tf, kx, ky, mx, my = self._aliasing_common()
         k = np.hypot(kx, ky)
         ux = np.divide(kx, k, out=np.zeros_like(kx), where=k > 0)
@@ -1714,6 +1738,7 @@ class fourierModel:
                              [[0., 0.]]*self.nGs), dtype=self.dtype)
         heights = self.ao.atm.heights*self.strechFactor
         power = np.zeros_like(kx)
+        optical_power = np.zeros_like(kx) if optical_pair else None
         durations = np.asarray([self._wfs_exposure_time(g) for g in range(self.nGs)])
         for m, n in zip(mx, my):
             qx, qy = kx-m/d, ky-n/d
@@ -1758,10 +1783,20 @@ class fourierModel:
                 piston = (qx != 0) | (qy != 0)
             if self.temporalModel == 'polc':
                 power += piston*spectrum*variance
+                if optical_pair:
+                    optical_power += ((qx != 0) | (qy != 0))*spectrum*variance
             else:
-                power += piston*spectrum*variance*np.abs(temporal)**2
-        return (power.reshape(self.freq.kxAO_.shape)*self.freq.mskInAO_
-                * self.ao.atm.r0**(-5/3)*0.0229)
+                temporal_power = np.abs(temporal)**2
+                power += piston*spectrum*variance*temporal_power
+                if optical_pair:
+                    optical_power += ((qx != 0) | (qy != 0))*spectrum*variance*temporal_power
+        result = (power.reshape(self.freq.kxAO_.shape)*self.freq.mskInAO_
+                  * self.ao.atm.r0**(-5/3)*0.0229)
+        if optical_pair:
+            optical = (optical_power.reshape(self.freq.kxAO_.shape)*self.freq.mskInAO_
+                       * self.ao.atm.r0**(-5/3)*0.0229)
+            return result, optical
+        return result
 
     def aliasingPSD(self, method=None, shift_batch=8, layer_chunk=5, n_times_limit=None, use_precompute=True,
                     piston_filter=True):
@@ -1937,14 +1972,20 @@ class fourierModel:
         self.t_windShakePSD = 1000*(time.time() - tstart)
         return self.freq.mskInAO_ * abs(psd)
 
-    def spatioTemporalPSD(self, piston_filter=True):
-        """%% Power spectrum density including reconstruction, field variations and temporal effects
+    def spatioTemporalPSD(self, piston_filter=True, optical_pair=False):
+        """Residual power including reconstruction, field and temporal effects.
+
+        For tomography, optical_pair returns (variance, optical) spectra using
+        the same residual responses with their distinct input-power weights.
         """
+        if optical_pair and (not piston_filter or self.nGs < 2):
+            raise ValueError('Paired spectra require tomography and piston_filter=True')
         tstart = time.time()
         nK = self.freq.resAO
         psd = np.zeros((nK,nK,self.ao.src.nSrc),
                        dtype=self.dtype)
         i = self.complex_dtype(1j)
+        optical_psd = np.zeros_like(psd) if optical_pair else None
         nH = self.ao.atm.nL
         Hs = np.asarray(self.ao.atm.heights) * np.asarray(self.strechFactor)
         Ws = np.asarray(self.ao.atm.weights)
@@ -1962,9 +2003,11 @@ class fourierModel:
         Watm = self.Wphi * factor
         if self.nGs > 1:
             covariance = self.Cphi
-            if not piston_filter:
+            if not piston_filter or optical_pair:
                 pf = self.freq.pistonFilterAO_[..., None]
-                covariance = np.divide(self.Cphi, pf, out=np.zeros_like(self.Cphi), where=pf > 0)
+                optical_covariance = np.divide(self.Cphi, pf, out=np.zeros_like(self.Cphi), where=pf > 0)
+                if not piston_filter:
+                    covariance = optical_covariance
         if self.nGs < 2:
             F = self.Rx*self.SxAv + self.Ry*self.SyAv
         two_pi_i = 2 * i * np.pi
@@ -2002,40 +2045,48 @@ class fourierModel:
                 fx = Beta[0]*self.freq.kxAO_
                 fy = Beta[1]*self.freq.kyAO_
                 
-                # Native construction with shape (nK, nK, 1, nH) to avoid .transpose()
-                # wDir_x is (nH,) -> [None, None, None, :]
-                # self.freq.kxAO_ is (nK, nK) -> [:, :, None, None]
-                freq_t = (
-                    wDir_x[None, None, None, :] * self.freq.kxAO_[:, :, None, None]
-                    + wDir_y[None, None, None, :] * self.freq.kyAO_[:, :, None, None]
-                )
-                delta_h = (
-                    Hs[None, None, None, :] * (fx + fy)[:, :, None, None]
-                    - deltaT * wSpeed[None, None, None, :] * freq_t
-                )
-                
-                PbetaL = np.exp(two_pi_i * delta_h)
-
                 if self.temporalModel == 'polc':
                     PbetaL = np.exp(two_pi_i*Hs[None, None, None, :]*(fx+fy)[:, :, None, None])
                     proj = PbetaL - np.matmul(self.PbetaDM[s], self.Walpha)*temporal[:, :, None, :]
                 else:
+                    # Native construction with shape (nK, nK, 1, nH) to avoid .transpose()
+                    # wDir_x is (nH,) -> [None, None, None, :]
+                    # self.freq.kxAO_ is (nK, nK) -> [:, :, None, None]
+                    freq_t = (
+                        wDir_x[None, None, None, :] * self.freq.kxAO_[:, :, None, None]
+                        + wDir_y[None, None, None, :] * self.freq.kyAO_[:, :, None, None]
+                    )
+                    delta_h = (
+                        Hs[None, None, None, :] * (fx + fy)[:, :, None, None]
+                        - deltaT * wSpeed[None, None, None, :] * freq_t
+                    )
+
+                    PbetaL = np.exp(two_pi_i * delta_h)
                     proj = PbetaL - np.matmul(self.PbetaDM[s], self.Walpha)
-                
+
                 # Cphi is now a 3D diagonal array (nK, nK, nL).
                 # proj @ Cphi @ proj_T massively simplifies to element-wise broadcasting:
                 # Cphi is already piston-filtered (see tomographicReconstructor)
                 if self.sensedLayers.all():
-                    tmp = np.sum(np.abs(proj[:, :, 0, :])**2 * covariance, axis=-1)
+                    residual_power = np.abs(proj[:, :, 0, :])**2
+                    tmp = np.sum(residual_power * covariance, axis=-1)
+                    if optical_pair:
+                        optical_tmp = np.sum(residual_power * optical_covariance, axis=-1)
                 else:
                     sensed = np.asarray(nnp.where(self.sensedLayers)[0])
-                    tmp = np.sum(np.abs(proj[:, :, 0, sensed])**2 * covariance[:, :, sensed], axis=-1) \
+                    residual_power = np.abs(proj[:, :, 0, sensed])**2
+                    tmp = np.sum(residual_power * covariance[:, :, sensed], axis=-1) \
                           + w_unsensed * self.Wphi
+                    if optical_pair:
+                        optical_tmp = np.sum(residual_power * optical_covariance[:, :, sensed], axis=-1) \
+                                      + w_unsensed * self.Wphi
                 psd[:, :, s] = self.freq.mskInAO_ * tmp
+                if optical_pair:
+                    optical_psd[:, :, s] = self.freq.mskInAO_ * optical_tmp
         if self.reduce_memory and piston_filter:
             self.Walpha = None
         self.t_spatioTemporalPSD = 1000*(time.time() - tstart)
-        return psd
+        return (psd, optical_psd) if optical_pair else psd
 
     def anisoplanatismPSD(self):
         """%% Anisoplanatism power spectrum density
