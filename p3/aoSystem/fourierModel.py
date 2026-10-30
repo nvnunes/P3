@@ -197,6 +197,16 @@ class fourierModel:
         self.dtype = self.ao.dtype
         self.complex_dtype = self.ao.complex_dtype
         self.my_data_map = self.ao.my_data_map
+        self.superResolution = self.my_data_map.get('sensor_HO', {}).get('SuperResolution', False)
+        if not isinstance(self.superResolution, bool):
+            raise ValueError('sensor_HO.SuperResolution must be True or False')
+        if self.superResolution:
+            raise ValueError('SuperResolution=True joint sampling is not supported; use GridOffsets with frequency-local reconstruction')
+        if self.my_data_map.get('sensor_HO', {}).get('PhaseSamplesPerSubaperture') is not None:
+            raise ValueError('PhaseSamplesPerSubaperture is not supported by the continuous-cell model')
+        if 'AliasOrder' in self.my_data_map.get('sensor_HO', {}):
+            raise ValueError('AliasOrder is not supported by the frequency-local WFS model')
+
 
         self.t_initAO = 1000*(time.time() - tstart)
 
@@ -283,6 +293,7 @@ class fourierModel:
             else:
                 self.gs = self.ao.ngs
                 self.nGs = self.ao.ngs.nSrc
+            self.wfsGridPhases = self._wfs_grid_phases()
             # Layers at or above a finite-altitude LGS are not sensed: they are
             # left uncorrected (open loop) instead of entering the cone
             # stretch 1/(1-h/z), which diverges at h=z and is negative above.
@@ -635,6 +646,29 @@ class fourierModel:
         return (bounds_down,bounds_up)
 
 #%% RECONSTRUCTOR DEFINITION
+    def _wfs_grid_phases(self):
+        """Return per-guide sampling phases, or None for coincident grids.
+
+        GridOffsets are physical [x, y] displacements in subaperture units,
+        demodulated on a common unshifted reference grid. This changes the
+        target sensing operator without changing the reconstruction rule.
+        """
+        settings = self.my_data_map.get('sensor_HO', {})
+        if 'GridOffsets' not in settings:
+            return None
+        offsets = np.asarray(settings['GridOffsets'], dtype=self.dtype)
+        if offsets.shape != (self.nGs, 2) or not bool(np.isfinite(offsets).all()):
+            raise ValueError('sensor_HO.GridOffsets must contain one finite [x, y] pair per WFS')
+        if not bool(np.any(offsets)):
+            return None
+        if self.nGs < 2 or any(w.wfstype.upper() != 'SHACK-HARTMANN'
+                               for w in self.ao.wfs.optics):
+            raise ValueError('Nonzero GridOffsets require multiple Shack-Hartmann WFSs')
+        pitches = np.asarray([w.dsub for w in self.ao.wfs.optics])
+        shift = (self.freq.kxAO_[..., None]*offsets[:, 0]
+                 + self.freq.kyAO_[..., None]*offsets[:, 1])*pitches
+        return np.exp(2j*np.pi*shift)
+
     def spatialReconstructor(self, MV=0):
         """
         Computes the WFS spatial reconstructor and the tomographic reconstructor
@@ -698,6 +732,8 @@ class fourierModel:
                                                    *np.exp(i*2*np.pi*Hs[h]*(fx+fy))
             fx = None
             fy = None
+            if self.wfsGridPhases is not None:
+                self.MPalphaL *= self.wfsGridPhases[..., None]
             self.Walpha = np.matmul(self.W,self.MPalphaL)
         if self.reduce_memory:
             self.MPalphaL = None
@@ -784,6 +820,9 @@ class fourierModel:
                 P_jn = np.exp(i*2*np.pi*h_mod[n]*(self.freq.kxAO_*self.gs.direction[0, j] \
                      + self.freq.kyAO_*self.gs.direction[1, j]))
                 MP[:, :, j, n] = M_diag_j * P_jn
+
+        if self.wfsGridPhases is not None:
+            MP *= self.wfsGridPhases[..., None]
 
         # 2. Atmospheric PSD (Diagonal with respect to the layers)
         atm_weights = np.asarray(self.ao.atm.weights, dtype=self.dtype)
