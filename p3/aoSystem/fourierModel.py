@@ -202,6 +202,12 @@ class fourierModel:
             raise ValueError('sensor_HO.SuperResolution must be True or False')
         if self.superResolution:
             raise ValueError('SuperResolution=True joint sampling is not supported; use GridOffsets with frequency-local reconstruction')
+        self.tomographicAliasing = self.my_data_map.get('sensor_HO', {}).get('TomographicAliasing', False)
+        if not isinstance(self.tomographicAliasing, bool):
+            raise ValueError('sensor_HO.TomographicAliasing must be True or False')
+        self.symmetricAliasing = self.my_data_map.get('sensor_HO', {}).get('SymmetricAliasing', False)
+        if not isinstance(self.symmetricAliasing, bool):
+            raise ValueError('sensor_HO.SymmetricAliasing must be True or False')
         if self.my_data_map.get('sensor_HO', {}).get('PhaseSamplesPerSubaperture') is not None:
             raise ValueError('PhaseSamplesPerSubaperture is not supported by the continuous-cell model')
         if 'AliasOrder' in self.my_data_map.get('sensor_HO', {}):
@@ -668,6 +674,14 @@ class fourierModel:
         shift = (self.freq.kxAO_[..., None]*offsets[:, 0]
                  + self.freq.kyAO_[..., None]*offsets[:, 1])*pitches
         return np.exp(2j*np.pi*shift)
+
+    def _scalar_wfs_gradient(self, qx, qy, ux, uy, pitch):
+        """Continuous square-cell gradient projected on the target orientation.
+
+        qx/qy are target or alias spatial frequencies in cycles per metre;
+        (ux, uy) is the unit vector of the reconstructed Fourier mode.
+        """
+        return 2j*np.pi*(ux*qx+uy*qy)*np.sinc(pitch*qx)*np.sinc(pitch*qy)
 
     def spatialReconstructor(self, MV=0):
         """
@@ -1290,6 +1304,10 @@ class fourierModel:
         self.t_fittingPSD = 1000*(time.time() - tstart)
         return psd
 
+    def _alias_shift_grid(self):
+        """Return alias indices, optionally retaining both outer replicas."""
+        return np.arange(-self.freq.nTimes, self.freq.nTimes+int(self.symmetricAliasing))
+
     def _aliasing_common(self):
         i = self.complex_dtype(1j)
         d = self.ao.wfs.optics[0].dsub
@@ -1313,7 +1331,7 @@ class fourierModel:
 
         kxAO = np.asarray(self.freq.kxAO_.ravel(), dtype=self.dtype)
         kyAO = np.asarray(self.freq.kyAO_.ravel(), dtype=self.dtype)
-        shift_grid = np.arange(-self.freq.nTimes, self.freq.nTimes)
+        shift_grid = self._alias_shift_grid()
         mi, ni = np.meshgrid(shift_grid, shift_grid, indexing='ij')
         mask = (mi != 0) | (ni != 0)
         m_flat = np.asarray(mi[mask], dtype=self.dtype)
@@ -1324,6 +1342,7 @@ class fourierModel:
         # Cheap signature to detect geometry/reconstructor changes and invalidate stale precompute data.
         return (
             int(self.freq.nTimes),
+            bool(self.symmetricAliasing),
             int(kxAO.size),
             float(d),
             float(self.ao.tel.D),
@@ -1493,6 +1512,63 @@ class fourierModel:
 
         return np.reshape(psd_vec, self.Rx.shape)
 
+    def _validate_tomographic_aliasing(self):
+        """Reject geometry outside the tomographic alias model's current scope."""
+        if (self.nGs < 2 or len(self.ao.dms.heights) != 1
+                or float(self.ao.dms.heights[0]) != 0):
+            raise ValueError('TomographicAliasing requires multiple WFSs and one ground-conjugate DM')
+        pitches = np.asarray([w.dsub for w in self.ao.wfs.optics])
+        if (any(w.wfstype.upper() != 'SHACK-HARTMANN' for w in self.ao.wfs.optics)
+                or not bool(np.allclose(pitches, pitches[0], rtol=1e-12, atol=0))):
+            raise ValueError('TomographicAliasing requires equal-pitch Shack-Hartmann WFSs')
+
+    def _tomographic_aliasing_psd(self, piston_filter=True):
+        """Propagate aliases through the configured tomographic estimator.
+
+        Use the scalar slope projected onto the target frequency. Keep the
+        ordinary alias comb, normalization and averaged temporal factor;
+        replace only the spatial Rx/Ry inverse with W. Layers are independent,
+        while each layer's alias is shared among guide stars.
+        Currently supports equal SH pitches and one ground-conjugate DM.
+        """
+        self._validate_tomographic_aliasing()
+        d, T, td, vx, vy, weights, _, _, tf, kx, ky, mx, my = self._aliasing_common()
+        k = np.hypot(kx, ky)
+        ux = np.divide(kx, k, out=np.zeros_like(kx), where=k > 0)
+        uy = np.divide(ky, k, out=np.zeros_like(ky), where=k > 0)
+        estimator = self.W[:, :, 0, :].reshape(-1, self.W.shape[-1])
+        offsets = np.asarray(self.my_data_map.get('sensor_HO', {}).get('GridOffsets',
+                             [[0., 0.]]*self.nGs), dtype=self.dtype)
+        heights = self.ao.atm.heights*self.strechFactor
+        power = np.zeros_like(kx)
+        for m, n in zip(mx, my):
+            qx, qy = kx-m/d, ky-n/d
+            cell_gradient = self._scalar_wfs_gradient(qx, qy, ux, uy, d)
+            sampled_estimator = estimator
+            if self.wfsGridPhases is not None:
+                shift = d*(qx[:, None]*offsets[:, 0]+qy[:, None]*offsets[:, 1])
+                sampled_estimator = estimator*np.exp(2j*np.pi*shift)
+            temporal = np.sum(weights[:, None]*np.sinc(qx[None]*vx[:, None]*T)
+                              * np.sinc(qy[None]*vy[:, None]*T)
+                              * np.exp(2j*np.pi*(qx[None]*vx[:, None]
+                                                + qy[None]*vy[:, None])*td), axis=0)*tf
+            variance = np.zeros_like(kx)
+            for layer, height in enumerate(heights):
+                if not self.sensedLayers[layer]:
+                    continue
+                angle = qx[:, None]*self.gs.direction[0] + qy[:, None]*self.gs.direction[1]
+                measurement = np.exp(2j*np.pi*height*angle)
+                response = np.sum(sampled_estimator*measurement, axis=-1)*cell_gradient
+                variance += weights[layer]*np.abs(response)**2
+            spectrum = (qx*qx+qy*qy+1/self.ao.atm.L0**2)**(-11/6)
+            piston = FourierUtils.pistonFilter(self.ao.tel.D, np.hypot(qx, qy).reshape(
+                self.freq.kxAO_.shape), dtype=self.dtype).ravel()
+            if not piston_filter:
+                piston = (qx != 0) | (qy != 0)
+            power += piston*spectrum*variance*np.abs(temporal)**2
+        return (power.reshape(self.freq.kxAO_.shape)*self.freq.mskInAO_
+                * self.ao.atm.r0**(-5/3)*0.0229)
+
     def aliasingPSD(self, method=None, shift_batch=8, layer_chunk=5, n_times_limit=None, use_precompute=True,
                     piston_filter=True):
         """
@@ -1503,6 +1579,10 @@ class fourierModel:
             - 'limited': comb truncation with streaming backend
         """
         tstart = time.time()
+        if self.tomographicAliasing:
+            psd = self._tomographic_aliasing_psd(piston_filter=piston_filter)
+            self.t_aliasingPSD = 1000*(time.time() - tstart)
+            return psd
 
         if method is None:
             method = 'chunked'

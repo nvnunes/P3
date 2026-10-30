@@ -19,6 +19,9 @@ def _model(path, optical=False, mode='tomo', reduced=False):
     if mode == 'scao':
         config['sources_HO'].update(Zenith='[0.]', Azimuth='[0.]', Height='0.')
         config['sensor_HO'].update(NumberPhotons='[10000]', NumberLenslets='[20]', NoiseVariance='[0.]')
+    if mode == 'tomographic_alias':
+        config['sensor_HO']['GridOffsets'] = '[[-.23,-.23],[.23,-.23],[.23,.23]]'
+        config['sensor_HO']['TomographicAliasing'] = 'True'
     if mode == 'open':
         config['RTC']['LoopGain_HO'] = '0.0'
     if mode == 'noisy':
@@ -30,7 +33,7 @@ def _model(path, optical=False, mode='tomo', reduced=False):
         reduce_memory=reduced, computeOpticalPSD=optical)
 
 
-@pytest.mark.parametrize('mode', ['tomo', 'scao', 'open', 'noisy'])
+@pytest.mark.parametrize('mode', ['tomo', 'scao', 'tomographic_alias', 'open', 'noisy'])
 def test_optical_request_preserves_variance_and_reconstruction(tmp_path, mode):
     legacy = _model(tmp_path/'legacy', mode=mode)
     optical = _model(tmp_path/'optical', optical=True, mode=mode)
