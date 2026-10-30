@@ -19,9 +19,11 @@ def _model(path, optical=False, mode='tomo', reduced=False):
     if mode == 'scao':
         config['sources_HO'].update(Zenith='[0.]', Azimuth='[0.]', Height='0.')
         config['sensor_HO'].update(NumberPhotons='[10000]', NumberLenslets='[20]', NoiseVariance='[0.]')
-    if mode == 'tomographic_alias':
+    if mode in ('tomographic_alias', 'alias_aware'):
         config['sensor_HO']['GridOffsets'] = '[[-.23,-.23],[.23,-.23],[.23,.23]]'
         config['sensor_HO']['TomographicAliasing'] = 'True'
+    if mode == 'alias_aware':
+        config['sensor_HO'].update(AliasAwareReconstruction='True', SymmetricAliasing='True')
     if mode == 'polc':
         config['sensor_HO']['TomographicAliasing'] = 'True'
         config['sensor_HO']['ExposureTime'] = '0.0'
@@ -37,7 +39,7 @@ def _model(path, optical=False, mode='tomo', reduced=False):
         reduce_memory=reduced, computeOpticalPSD=optical)
 
 
-@pytest.mark.parametrize('mode', ['tomo', 'scao', 'tomographic_alias', 'polc', 'open', 'noisy'])
+@pytest.mark.parametrize('mode', ['tomo', 'scao', 'tomographic_alias', 'alias_aware', 'polc', 'open', 'noisy'])
 def test_optical_request_preserves_variance_and_reconstruction(tmp_path, mode):
     legacy = _model(tmp_path/'legacy', mode=mode)
     optical = _model(tmp_path/'optical', optical=True, mode=mode)

@@ -236,6 +236,13 @@ class fourierModel:
         self.tomographicAliasing = self.my_data_map.get('sensor_HO', {}).get('TomographicAliasing', False)
         if not isinstance(self.tomographicAliasing, bool):
             raise ValueError('sensor_HO.TomographicAliasing must be True or False')
+        self.aliasAwareReconstruction = self.my_data_map.get('sensor_HO', {}).get('AliasAwareReconstruction', False)
+        if not isinstance(self.aliasAwareReconstruction, bool):
+            raise ValueError('sensor_HO.AliasAwareReconstruction must be True or False')
+        if self.my_data_map.get('sensor_HO', {}).get('WfsSlopeMode', 'radial') != 'radial':
+            raise ValueError('WfsSlopeMode is not configurable; AliasAwareReconstruction selects the measurement channels')
+        if 'DiagnosticAbsoluteFloor' in self.my_data_map.get('sensor_HO', {}):
+            raise ValueError('DiagnosticAbsoluteFloor is not supported; use TomographicRegularizationFloor')
         self.symmetricAliasing = self.my_data_map.get('sensor_HO', {}).get('SymmetricAliasing', False)
         if not isinstance(self.symmetricAliasing, bool):
             raise ValueError('sensor_HO.SymmetricAliasing must be True or False')
@@ -336,6 +343,8 @@ class fourierModel:
                 self._validate_tomographic_aliasing()
             if self.exposureTime is not None and self.nGs < 2:
                 raise ValueError('ExposureTime currently requires multiple WFSs')
+            if self.aliasAwareReconstruction:
+                self._validate_tomographic_aliasing()
             # Layers at or above a finite-altitude LGS are not sensed: they are
             # left uncorrected (open loop) instead of entering the cone
             # stretch 1/(1-h/z), which diverges at h=z and is negative above.
@@ -749,6 +758,43 @@ class fourierModel:
         """
         return 2j*np.pi*(ux*qx+uy*qy)*np.sinc(pitch*qx)*np.sinc(pitch*qy)
 
+    def _wfs_xy_measurement(self, qx, qy, heights, sensed, exposure=False):
+        """Return (..., 2*nGs, layers) square-cell responses in gradient units.
+
+        Channels are interleaved by guide (x then y). Spatial frequencies are
+        cycles/metre and heights are metres; shifts use the physical frequency.
+        Static reconstruction excludes exposure averaging. Propagation includes
+        each WFS's exposure independently for each atmospheric layer.
+        """
+        response = np.zeros(qx.shape+(2*self.nGs, len(heights)), dtype=self.complex_dtype)
+        offsets = np.asarray(self.my_data_map.get('sensor_HO', {}).get(
+            'GridOffsets', [[0., 0.]]*self.nGs), dtype=self.dtype)
+        for guide in range(self.nGs):
+            pitch = self.ao.wfs.optics[guide].dsub
+            gx = self._scalar_wfs_gradient(qx, qy, 1., 0., pitch)
+            gy = self._scalar_wfs_gradient(qx, qy, 0., 1., pitch)
+            shift = pitch*(qx*offsets[guide, 0]+qy*offsets[guide, 1])
+            angle = qx*self.gs.direction[0, guide]+qy*self.gs.direction[1, guide]
+            for layer, height in enumerate(heights):
+                if not sensed[layer]:
+                    continue
+                factor = np.exp(2j*np.pi*(shift+height*angle))
+                if exposure:
+                    frequency = self._layer_temporal_frequencies(qx, qy)[..., layer]
+                    factor *= np.sinc(self._wfs_exposure_time(guide)*frequency)
+                response[..., 2*guide, layer] = gx*factor
+                response[..., 2*guide+1, layer] = gy*factor
+        return response
+
+    def _measurement_noise_variances(self):
+        """Per-channel variances in P3's existing measurement-noise units.
+
+        Each WFS value describes one axis. Independent x/y channels have that
+        same variance, not half the value; the radial projection has unit norm.
+        """
+        variance = np.asarray(self.ao.wfs.processing.noiseVar, dtype=self.dtype)
+        return np.repeat(variance, 2) if self.aliasAwareReconstruction else variance
+
     def spatialReconstructor(self, MV=0):
         """
         Computes the WFS spatial reconstructor and the tomographic reconstructor
@@ -816,6 +862,9 @@ class fourierModel:
             fy = None
             if self.wfsGridPhases is not None:
                 self.MPalphaL *= self.wfsGridPhases[..., None]
+            if self.aliasAwareReconstruction:
+                self.MPalphaL = self._wfs_xy_measurement(
+                    self.freq.kxAO_, self.freq.kyAO_, Hs, self.sensedLayers, exposure=True)
             self.Walpha = np.matmul(self.W,self.MPalphaL)
         if self.reduce_memory:
             self.MPalphaL = None
@@ -906,6 +955,10 @@ class fourierModel:
         if self.wfsGridPhases is not None:
             MP *= self.wfsGridPhases[..., None]
 
+        if self.aliasAwareReconstruction:
+            MP = self._wfs_xy_measurement(
+                self.freq.kxAO_, self.freq.kyAO_, h_mod, sensed_mod)
+
         # 2. Atmospheric PSD (Diagonal with respect to the layers)
         atm_weights = np.asarray(self.ao.atm.weights, dtype=self.dtype)
         cte = (24 * spc.gamma(6/5)/5)**(5/6) * (spc.gamma(11/6)**2. / (2.*np.pi**(11/3))).astype(self.dtype)
@@ -929,9 +982,13 @@ class fourierModel:
         # MP @ Cphi_mod @ MP_t
         MP_Cphi = MP * self.Cphi_mod[:, :, None, :]
         to_inv  = np.matmul(MP_Cphi, MP_t)
+        if self.aliasAwareReconstruction:
+            to_inv += self._alias_measurement_covariance(h_mod, self.atm_mod.weights, sensed_mod)
         
         # Direct addition of noise on the diagonal (completely eliminates self.Cb allocation)
-        noise_var = np.asarray(self.ao.wfs.processing.noiseVar, dtype=self.complex_dtype)
+        noise_var = self._measurement_noise_variances().astype(self.complex_dtype)
+        if self.aliasAwareReconstruction:
+            nGs *= 2
         idx = np.arange(nGs)
         # At low k all GS see the same turbulence (to_inv ~ rank 1): with a
         # (nearly) noise-free WFS the system is singular and the solution
@@ -1610,10 +1667,36 @@ class fourierModel:
                 or not bool(np.allclose(pitches, pitches[0], rtol=1e-12, atol=0))):
             raise ValueError('TomographicAliasing requires equal-pitch Shack-Hartmann WFSs')
 
+    def _alias_measurement_covariance(self, heights, weights, sensed):
+        """Correlated x/y alias covariance for the frequency-local MMSE solve.
+
+        Interleaved guide/axis measurements share each layer's physical alias.
+        Exposure and controller response enter propagation, not this static
+        reconstruction prior. The retained alias comb and phase-PSD units agree
+        with the actual-reconstructor alias propagation.
+        """
+        kx, ky = self.freq.kxAO_, self.freq.kyAO_
+        d = self.ao.wfs.optics[0].dsub
+        channels = 2*self.nGs
+        covariance = np.zeros(kx.shape+(channels, channels), dtype=self.complex_dtype)
+        for m in self._alias_shift_grid():
+            for n in self._alias_shift_grid():
+                if m == 0 and n == 0:
+                    continue
+                qx, qy = kx-m/d, ky-n/d
+                response = self._wfs_xy_measurement(qx, qy, heights, sensed)
+                spectrum = (.0229*self.ao.atm.r0**(-5/3)
+                    *(qx*qx+qy*qy+1/self.ao.atm.L0**2)**(-11/6)
+                    *FourierUtils.pistonFilter(self.ao.tel.D,np.hypot(qx,qy),dtype=self.dtype))
+                layer_power = spectrum[:,:,None]*np.asarray(weights)
+                covariance += (response*layer_power[:,:,None,:]) @ np.conj(response.swapaxes(-1,-2))
+        return covariance
+
     def _tomographic_aliasing_psd(self, piston_filter=True):
         """Propagate aliases through the configured tomographic estimator.
 
-        Use the scalar slope projected onto the target frequency. Keep the
+        Alias-aware reconstruction retains both x/y slope channels; otherwise
+        use the scalar slope projected onto the target frequency. Keep the
         ordinary alias comb, normalization and averaged
         temporal factor for the integrator; replace only the spatial Rx/Ry inverse with W. POLC
         applies exposure and controller response per physical alias and layer
@@ -1636,7 +1719,7 @@ class fourierModel:
             qx, qy = kx-m/d, ky-n/d
             cell_gradient = self._scalar_wfs_gradient(qx, qy, ux, uy, d)
             sampled_estimator = estimator
-            if self.wfsGridPhases is not None:
+            if self.wfsGridPhases is not None and not self.aliasAwareReconstruction:
                 shift = d*(qx[:, None]*offsets[:, 0]+qy[:, None]*offsets[:, 1])
                 sampled_estimator = estimator*np.exp(2j*np.pi*shift)
             # Preserve the default integrator's averaged factor exactly.
@@ -1648,18 +1731,26 @@ class fourierModel:
                                   * np.sinc(qy[None]*vy[:, None]*T)
                                   * np.exp(2j*np.pi*(qx[None]*vx[:, None]
                                                     + qy[None]*vy[:, None])*td), axis=0)*tf
-            variance = np.zeros_like(kx)
-            for layer, height in enumerate(heights):
-                if not self.sensedLayers[layer]:
-                    continue
-                angle = qx[:, None]*self.gs.direction[0] + qy[:, None]*self.gs.direction[1]
-                measurement = np.exp(2j*np.pi*height*angle)
+            if self.aliasAwareReconstruction:
+                measured = self._wfs_xy_measurement(
+                    qx, qy, heights, self.sensedLayers, exposure=self.temporalModel == 'polc')
+                command = np.einsum('km,kml->kl', estimator, measured)
                 if self.temporalModel == 'polc':
-                    measurement *= np.sinc(frequency[:, layer, None]*durations)
-                response = np.sum(sampled_estimator*measurement, axis=-1)*cell_gradient
-                if self.temporalModel == 'polc':
-                    response *= transfer[:, layer]
-                variance += weights[layer]*np.abs(response)**2
+                    command *= transfer
+                variance = np.sum(weights[None]*np.abs(command)**2, axis=-1)
+            else:
+                variance = np.zeros_like(kx)
+                for layer, height in enumerate(heights):
+                    if not self.sensedLayers[layer]:
+                        continue
+                    angle = qx[:, None]*self.gs.direction[0] + qy[:, None]*self.gs.direction[1]
+                    measurement = np.exp(2j*np.pi*height*angle)
+                    if self.temporalModel == 'polc':
+                        measurement *= np.sinc(frequency[:, layer, None]*durations)
+                    response = np.sum(sampled_estimator*measurement, axis=-1)*cell_gradient
+                    if self.temporalModel == 'polc':
+                        response *= transfer[:, layer]
+                    variance += weights[layer]*np.abs(response)**2
             spectrum = (qx*qx+qy*qy+1/self.ao.atm.L0**2)**(-11/6)
             piston = FourierUtils.pistonFilter(self.ao.tel.D, np.hypot(qx, qy).reshape(
                 self.freq.kxAO_.shape), dtype=self.dtype).ravel()
@@ -1724,7 +1815,7 @@ class fourierModel:
         psd = np.zeros(shape, dtype=self.dtype)
         mean_noise_var = np.asarray(self.ao.wfs.processing.noiseVar, dtype=self.dtype).mean()
         has_noise = (bool(np.any(self.ao.wfs.processing.noiseVar > 0))
-                     if self.temporalModel == 'polc'
+                     if self.temporalModel == 'polc' or self.aliasAwareReconstruction
                      else float(self.ao.wfs.processing.noiseVar[0]) > 0)
         if has_noise:
             if self.nGs < 2:
@@ -1749,7 +1840,7 @@ class fourierModel:
                 noise_gain = min(0.8, 0.4 + 0.1333 * self.ao.rtc.holoop['delay']) ** 2
                 if self.temporalModel == 'polc':
                     noise_gain = self.noiseGain
-                noise_var = np.asarray(self.ao.wfs.processing.noiseVar, dtype=self.dtype)
+                noise_var = self._measurement_noise_variances()
                 
                 for j in range(self.ao.src.nSrc):
                     PW = np.matmul(self.PbetaDM[j], self.W)
@@ -1874,7 +1965,8 @@ class fourierModel:
             if not piston_filter:
                 pf = self.freq.pistonFilterAO_[..., None]
                 covariance = np.divide(self.Cphi, pf, out=np.zeros_like(self.Cphi), where=pf > 0)
-        F = self.Rx*self.SxAv + self.Ry*self.SyAv
+        if self.nGs < 2:
+            F = self.Rx*self.SxAv + self.Ry*self.SyAv
         two_pi_i = 2 * i * np.pi
         if self.temporalModel == 'polc':
             temporal = self._polc_response(

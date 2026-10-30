@@ -30,6 +30,7 @@ def test_relative_offsets_change_only_measurement_reference(tmp_path, monkeypatc
     np.testing.assert_array_equal(shifted.Cphi, stock.Cphi)
     assert not shifted.superResolution
     assert not shifted.tomographicAliasing
+    assert not shifted.aliasAwareReconstruction
 
 
 @pytest.mark.parametrize('option', [
