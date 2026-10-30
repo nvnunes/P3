@@ -197,6 +197,12 @@ class fourierModel:
         self.dtype = self.ao.dtype
         self.complex_dtype = self.ao.complex_dtype
         self.my_data_map = self.ao.my_data_map
+        self.tomoRelRegFloor = self.my_data_map.get('sensor_HO', {}).get(
+            'TomographicRegularizationFloor', self.tomoRelRegFloor)
+        value = self.tomoRelRegFloor
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not nnp.isfinite(value) or value < 0):
+            raise ValueError('sensor_HO.TomographicRegularizationFloor must be a finite nonnegative fraction')
         self.superResolution = self.my_data_map.get('sensor_HO', {}).get('SuperResolution', False)
         if not isinstance(self.superResolution, bool):
             raise ValueError('sensor_HO.SuperResolution must be True or False')
