@@ -205,6 +205,15 @@ class fourierModel:
         self.dtype = self.ao.dtype
         self.complex_dtype = self.ao.complex_dtype
         self.my_data_map = self.ao.my_data_map
+        self.finiteApertureReconstruction = self.my_data_map.get('sensor_HO', {}).get(
+            'FiniteApertureReconstruction', False)
+        if not isinstance(self.finiteApertureReconstruction, bool):
+            raise ValueError('sensor_HO.FiniteApertureReconstruction must be boolean')
+        if self.finiteApertureReconstruction and calcPSF:
+            raise ValueError('FiniteApertureReconstruction requires covariance optics through TIPTOP; use calcPSF=False in P3')
+        if self.finiteApertureReconstruction and self.reduce_memory:
+            raise ValueError('FiniteApertureReconstruction currently requires reduce_memory=False')
+        self.finiteApertureBackend = None
         self.tomoRelRegFloor = self.my_data_map.get('sensor_HO', {}).get(
             'TomographicRegularizationFloor', self.tomoRelRegFloor)
         value = self.tomoRelRegFloor
@@ -638,6 +647,24 @@ class fourierModel:
         # DISPLAYING EXECUTION TIMES
         if self.verbose:
             self.displayExecutionTime()
+
+    def finite_aperture_covariance(self, sampling, field):
+        """Return fitted-pupil residual covariance for the finite sensing option.
+
+        Sampling supplies physical pupil coordinates and original ramp-fit
+        moments. The returned covariance is radians squared, not a PSD.
+        Native PSDs remain predecessor diagnostics; they are not added to this
+        atmospheric covariance. Geometry/atmosphere/configuration changes
+        invalidate this instance's reconstruction cache before prediction.
+        """
+        if not self.finiteApertureReconstruction:
+            raise ValueError('FiniteApertureReconstruction is disabled')
+        from .finiteAperture import FiniteApertureReconstructor, input_signature, validate_native
+        validate_native(self)
+        signature = input_signature(self)
+        if self.finiteApertureBackend is None or self.finiteApertureBackend.signature != signature:
+            self.finiteApertureBackend = FiniteApertureReconstructor(self)
+        return self.finiteApertureBackend.residual_covariance(sampling, field)
 
     def _sensed_layers_mask(self, heights) -> nnp.ndarray:
         """Boolean mask of the layers seen by the HO guide star (all of them for NGS)."""
