@@ -12,7 +12,7 @@ from test_p3_bugfixes_noise_tomo import _INI_TEMPLATE, _build
 def _case(tmp_path, temporal=None, exposure=None, noise='[0., 0., 0.]', extra=''):
     tmp_path.mkdir(parents=True, exist_ok=True)
     text = _INI_TEMPLATE.format(nph=[10000]*3, noisevar=noise)
-    text = text.replace('[sensor_HO]', '[sensor_HO]\nTomographicAliasing = True\n'
+    text = text.replace('[sensor_HO]', "[sensor_HO]\nReconstructionModel = 'alias_aware'\n"
                         'GridOffsets = [[-.23,-.23],[.23,-.23],[.23,.23]]\n'+extra)
     if temporal is not None:
         text = text.replace('[RTC]', f'[RTC]\nTemporalModel_HO = {temporal!r}')
@@ -137,7 +137,7 @@ def test_alias_power_matches_independent_cell_and_time_integration(tmp_path, exp
                     phase = np.exp(2j*np.pi*(q[0]*(nodes[:, None]+center[0])+
                                              q[1]*(nodes[None, :]+center[1])))
                     cell = np.einsum('i,ij,j->', weights, phase, weights)
-                    measured.append(2j*np.pi*(unit @ q)*cell)
+                    measured.extend(2j*np.pi*q*cell)
                 command = model.W[row, col, 0] @ np.array(measured)*window[layer]*timing[layer]
                 spectrum = (q @ q+1/model.ao.atm.L0**2)**(-11/6)
                 piston = pistonFilter(model.ao.tel.D, np.array([[np.linalg.norm(q)]]))[0, 0]
@@ -151,7 +151,7 @@ def test_alias_power_matches_independent_cell_and_time_integration(tmp_path, exp
     ('polc', '-1', '', 'ExposureTime'),
     ('polc', 'True', '', 'ExposureTime'),
     ('polc', "'instantaneous'", '', 'ExposureTime'),
-    ('polc', '0.0', 'TomographicAliasing = False', 'TomographicAliasing'),
+    ('polc', '0.0', "ReconstructionModel = 'standard'", 'ReconstructionModel'),
 ])
 def test_invalid_configuration_is_rejected(tmp_path, temporal, exposure, extra, match):
     # Avoid duplicate-key parsing when exercising the disabled-alias contract.

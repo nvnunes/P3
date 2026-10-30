@@ -19,9 +19,8 @@ def test_unsupported_sampling_settings_fail(tmp_path, option, name):
 
 
 def test_scalar_defaults_remain_available(tmp_path):
-    model = _case(tmp_path, "SuperResolution = False\nWfsSlopeMode = 'radial'\n"
-                            'PhaseSamplesPerSubaperture = None')
-    assert not model.superResolution
+    model = _case(tmp_path, 'PhaseSamplesPerSubaperture = None')
+    assert model.reconstructionModel == 'standard'
     assert not hasattr(model, 'sampledWfs')
     assert model.W.shape[-1] == model.nGs
     assert not hasattr(model, 'wfsSlopeMode')

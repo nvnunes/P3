@@ -23,6 +23,7 @@ from p3.aoSystem.atmosphere import atmosphere
 from p3.aoSystem.frequencyDomain import frequencyDomain
 from p3.aoSystem.airRefraction import MatharAirRefraction
 from p3.aoSystem.processing import is_auto_noise_var
+from p3.aoSystem.reconstruction import reconstruction_model
 
 #%% DISPLAY FEATURES
 mpl.rcParams['font.size'] = 16
@@ -61,7 +62,7 @@ class fourierModel:
 
     ``[RTC] TemporalModel_HO`` defaults to ``'integrator'`` (existing P3
     behaviour). ``'polc'`` selects a queued leaky pseudo-open-loop response for
-    tomographic systems using ``TomographicAliasing=True``; its current alias
+    tomographic ``alias_aware`` or ``finite_aperture`` models; their current
     geometry requires equal-pitch SH WFSs and one ground-conjugate DM.
     ``[sensor_HO] ExposureTime`` is a centered WFS integration duration in
     seconds: zero is instantaneous; omitted/None uses detector clock/loop rate.
@@ -205,6 +206,13 @@ class fourierModel:
         self.dtype = self.ao.dtype
         self.complex_dtype = self.ao.complex_dtype
         self.my_data_map = self.ao.my_data_map
+        self.reconstructionModel = reconstruction_model(self.my_data_map.get('sensor_HO', {}))
+        self.finiteApertureReconstruction = self.reconstructionModel == 'finite_aperture'
+        if self.finiteApertureReconstruction and calcPSF:
+            raise ValueError("ReconstructionModel='finite_aperture' requires covariance optics through TIPTOP; use calcPSF=False in P3")
+        if self.finiteApertureReconstruction and self.reduce_memory:
+            raise ValueError("ReconstructionModel='finite_aperture' currently requires reduce_memory=False")
+        self.finiteApertureBackend = None
         self.tomoRelRegFloor = self.my_data_map.get('sensor_HO', {}).get(
             'TomographicRegularizationFloor', self.tomoRelRegFloor)
         value = self.tomoRelRegFloor
@@ -228,24 +236,14 @@ class fourierModel:
                     or not nnp.isfinite(rtc['delay']) or rtc['delay'] < 0
                     or rtc['delay'] != int(rtc['delay'])):
                 raise ValueError('POLC requires gain in [0,1], positive rate and a nonnegative integer delay')
-        self.superResolution = self.my_data_map.get('sensor_HO', {}).get('SuperResolution', False)
-        if not isinstance(self.superResolution, bool):
-            raise ValueError('sensor_HO.SuperResolution must be True or False')
-        if self.superResolution:
-            raise ValueError('SuperResolution=True joint sampling is not supported; use GridOffsets with frequency-local reconstruction')
-        self.tomographicAliasing = self.my_data_map.get('sensor_HO', {}).get('TomographicAliasing', False)
-        if not isinstance(self.tomographicAliasing, bool):
-            raise ValueError('sensor_HO.TomographicAliasing must be True or False')
-        self.aliasAwareReconstruction = self.my_data_map.get('sensor_HO', {}).get('AliasAwareReconstruction', False)
-        if not isinstance(self.aliasAwareReconstruction, bool):
-            raise ValueError('sensor_HO.AliasAwareReconstruction must be True or False')
-        if self.my_data_map.get('sensor_HO', {}).get('WfsSlopeMode', 'radial') != 'radial':
-            raise ValueError('WfsSlopeMode is not configurable; AliasAwareReconstruction selects the measurement channels')
+        # Algorithm details belong to the selected model, not public switches.
+        self.aliasAwareReconstruction = self.reconstructionModel == 'alias_aware'
+        self.tomographicAliasing = self.aliasAwareReconstruction
+        self.symmetricAliasing = self.aliasAwareReconstruction
+        if 'WfsSlopeMode' in self.my_data_map.get('sensor_HO', {}):
+            raise ValueError('WfsSlopeMode is not configurable; ReconstructionModel owns the measurement channels')
         if 'DiagnosticAbsoluteFloor' in self.my_data_map.get('sensor_HO', {}):
             raise ValueError('DiagnosticAbsoluteFloor is not supported; use TomographicRegularizationFloor')
-        self.symmetricAliasing = self.my_data_map.get('sensor_HO', {}).get('SymmetricAliasing', False)
-        if not isinstance(self.symmetricAliasing, bool):
-            raise ValueError('sensor_HO.SymmetricAliasing must be True or False')
         if self.my_data_map.get('sensor_HO', {}).get('PhaseSamplesPerSubaperture') is not None:
             raise ValueError('PhaseSamplesPerSubaperture is not supported by the continuous-cell model')
         if 'AliasOrder' in self.my_data_map.get('sensor_HO', {}):
@@ -338,8 +336,8 @@ class fourierModel:
                 self.nGs = self.ao.ngs.nSrc
             self.wfsGridPhases = self._wfs_grid_phases()
             if self.temporalModel == 'polc':
-                if not self.tomographicAliasing:
-                    raise ValueError('POLC currently requires TomographicAliasing = True')
+                if self.reconstructionModel == 'standard':
+                    raise ValueError("POLC currently requires ReconstructionModel='alias_aware' or 'finite_aperture'")
                 self._validate_tomographic_aliasing()
             if self.exposureTime is not None and self.nGs < 2:
                 raise ValueError('ExposureTime currently requires multiple WFSs')
@@ -468,6 +466,19 @@ class fourierModel:
             # after noise PSD computation where r0 at 500 nm is needed
             self.ao.atm.wvl  = self.freq.wvlRef
             self.atm_mod.wvl = self.freq.wvlRef
+
+            if self.finiteApertureReconstruction:
+                # Shared grid/atmosphere and projector normalization are needed by
+                # the finite estimator. Ordinary weights, PSD and controller power
+                # propagation are neither inputs nor additive residual terms.
+                self.Wphi = self.ao.atm.spectrum(np.sqrt(self.freq.k2AO_))
+                self.Popt = self.optimalProjector()
+                self.PSD = None
+                from .finiteAperture import validate_native
+                validate_native(self)
+                self.bounds = self.define_bounds()
+                self.t_init = 1000*(time.time()-tstart)
+                return
 
             # COMPUTE THE PSD -- once per entry in self.freq.wvl_grids.
             # In the legacy/shared-grid case (psdPerWavelength disabled, or a
@@ -638,6 +649,23 @@ class fourierModel:
         # DISPLAYING EXECUTION TIMES
         if self.verbose:
             self.displayExecutionTime()
+
+    def finite_aperture_covariance(self, sampling, field):
+        """Return fitted-pupil residual covariance for the finite sensing option.
+
+        Sampling supplies physical pupil coordinates and original ramp-fit
+        moments. The returned covariance is radians squared, not a PSD.
+        No diagonal atmospheric PSD is computed or added to this covariance. Geometry/atmosphere/configuration changes
+        invalidate this instance's reconstruction cache before prediction.
+        """
+        if not self.finiteApertureReconstruction:
+            raise ValueError("ReconstructionModel='finite_aperture' is disabled")
+        from .finiteAperture import FiniteApertureReconstructor, input_signature, validate_native
+        validate_native(self)
+        signature = input_signature(self)
+        if self.finiteApertureBackend is None or self.finiteApertureBackend.signature != signature:
+            self.finiteApertureBackend = FiniteApertureReconstructor(self)
+        return self.finiteApertureBackend.residual_covariance(sampling, field)
 
     def _sensed_layers_mask(self, heights) -> nnp.ndarray:
         """Boolean mask of the layers seen by the HO guide star (all of them for NGS)."""
@@ -1681,11 +1709,11 @@ class fourierModel:
         """Reject geometry outside the tomographic alias model's current scope."""
         if (self.nGs < 2 or len(self.ao.dms.heights) != 1
                 or float(self.ao.dms.heights[0]) != 0):
-            raise ValueError('TomographicAliasing requires multiple WFSs and one ground-conjugate DM')
+            raise ValueError('Selected reconstruction model requires multiple WFSs and one ground-conjugate DM')
         pitches = np.asarray([w.dsub for w in self.ao.wfs.optics])
         if (any(w.wfstype.upper() != 'SHACK-HARTMANN' for w in self.ao.wfs.optics)
                 or not bool(np.allclose(pitches, pitches[0], rtol=1e-12, atol=0))):
-            raise ValueError('TomographicAliasing requires equal-pitch Shack-Hartmann WFSs')
+            raise ValueError('Selected reconstruction model requires equal-pitch Shack-Hartmann WFSs')
 
     def _alias_measurement_covariance(self, heights, weights, sensed):
         """Correlated x/y alias covariance for the frequency-local MMSE solve.

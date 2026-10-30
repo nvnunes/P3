@@ -3,8 +3,7 @@ import numpy as np
 import pytest
 from test_alias_aware_xy_propagation import _model
 
-@pytest.mark.parametrize('controller', ['integrator', 'polc'])
-@pytest.mark.parametrize('aware', [False, True])
+@pytest.mark.parametrize('controller,aware', [('integrator', False), ('integrator', True), ('polc', True)])
 @pytest.mark.parametrize('exposure', [0., .001])
 def test_paired_spectra_equal_independent_calls(tmp_path, controller, aware, exposure):
     model = _model(tmp_path/'model', controller, [.01, .02, .03], exposure, aware)

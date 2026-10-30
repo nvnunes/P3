@@ -13,8 +13,8 @@ def _model(path, temporal, noise, exposure=0., aware=True):
     c=ConfigParser();c.optionxform=str
     c.read_string(_INI_TEMPLATE.format(nph=[10000,15000,20000],noisevar=repr(noise)))
     c['sources_science'].update(Zenith='[0.,15.,30.]',Azimuth='[0.,45.,135.]')
-    c['sensor_HO'].update(AliasAwareReconstruction=repr(aware),TomographicAliasing='True',
-        SymmetricAliasing='True',GridOffsets='[[-.23,-.23],[.23,-.23],[.23,.23]]',
+    c['sensor_HO'].update(ReconstructionModel=repr('alias_aware' if aware else 'standard'),
+        GridOffsets='[[-.23,-.23],[.23,-.23],[.23,.23]]',
         ExposureTime=repr(exposure),TomographicRegularizationFloor='1e-6')
     c['RTC']['TemporalModel_HO']=repr(temporal)
     with (path/'system.ini').open('w') as f:c.write(f)
@@ -51,14 +51,16 @@ def test_noise_covariance_and_propagation_keep_both_axes(tmp_path,temporal,noise
 
 @pytest.mark.parametrize('temporal',['integrator','polc'])
 def test_embedding_combined_weights_preserves_noise_power(tmp_path,temporal):
-    scalar=_model(tmp_path/'scalar',temporal,[.01,.02,.03],aware=False)
+    scalar=_model(tmp_path/'scalar','integrator',[.01,.02,.03],aware=False)
+    scalar.temporalModel=temporal
+    scalar.controller()
     xy=_model(tmp_path/'xy',temporal,[.01,.02,.03])
     k=np.hypot(xy.freq.kxAO_,xy.freq.kyAO_)
     ux=np.divide(xy.freq.kxAO_,k,out=np.zeros_like(k),where=k>0)
     uy=np.divide(xy.freq.kyAO_,k,out=np.zeros_like(k),where=k>0)
     xy.W=np.stack((scalar.W*ux[...,None,None],scalar.W*uy[...,None,None]),axis=-1).reshape(
         *scalar.W.shape[:-1],2*scalar.nGs)
-    np.testing.assert_allclose(xy.noisePSD(),scalar.psdNoise,rtol=3e-13,atol=1e-14)
+    np.testing.assert_allclose(xy.noisePSD(),scalar.noisePSD(),rtol=3e-13,atol=1e-14)
 
 
 @pytest.mark.parametrize('temporal',['integrator','polc'])

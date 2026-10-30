@@ -21,11 +21,11 @@ def _model(path, optical=False, mode='tomo', reduced=False):
         config['sensor_HO'].update(NumberPhotons='[10000]', NumberLenslets='[20]', NoiseVariance='[0.]')
     if mode in ('tomographic_alias', 'alias_aware'):
         config['sensor_HO']['GridOffsets'] = '[[-.23,-.23],[.23,-.23],[.23,.23]]'
-        config['sensor_HO']['TomographicAliasing'] = 'True'
+        config['sensor_HO']['ReconstructionModel'] = "'alias_aware'"
     if mode == 'alias_aware':
-        config['sensor_HO'].update(AliasAwareReconstruction='True', SymmetricAliasing='True')
+        config['sensor_HO']['ReconstructionModel'] = "'alias_aware'"
     if mode == 'polc':
-        config['sensor_HO']['TomographicAliasing'] = 'True'
+        config['sensor_HO']['ReconstructionModel'] = "'alias_aware'"
         config['sensor_HO']['ExposureTime'] = '0.0'
         config['RTC']['TemporalModel_HO'] = "'polc'"
     if mode == 'open':

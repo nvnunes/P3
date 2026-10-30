@@ -6,29 +6,12 @@ import pytest
 from test_tomographic_aliasing import _case
 
 
-@pytest.mark.parametrize('sampling', ['', 'GridOffsets = [[-.23,-.23],[.23,-.23],[.23,.23]]'])
-def test_disabled_option_and_prior_are_unchanged(tmp_path, sampling):
-    native = _case(tmp_path/'native',sampling+'\nTomographicAliasing = True')
-    disabled = _case(tmp_path/'disabled',
-        sampling+'\nTomographicAliasing = True\nAliasAwareReconstruction = False')
-    aware = _case(tmp_path/'aware',
-        sampling+'\nTomographicAliasing = True\nAliasAwareReconstruction = True')
-    np.testing.assert_array_equal(native.PSD,disabled.PSD)
-    for field in ('Popt','Cphi','Cphi_mod','h1','h2','hn'):
-        np.testing.assert_array_equal(getattr(native,field),getattr(aware,field))
-    assert aware.W.shape[-1] == 2*native.W.shape[-1]
-    assert not np.array_equal(native.W,aware.W)
-    assert np.isfinite(aware.PSD).all()
-    assert aware.PSD.min() >= 0
-
-
 @pytest.mark.parametrize('offsets', [None, [[.23,-.23]]*3,
                                     [[-.23,-.23],[.23,-.23],[.23,.23]]])
-@pytest.mark.parametrize('symmetric', [False, True])
+@pytest.mark.parametrize('symmetric', [True])
 @pytest.mark.parametrize('noise', [[0.,0.,0.],[.01,.02,.03],[0.,.02,.03],[None]])
 def test_covariance_and_estimator_match_direct_sampled_cells(tmp_path, offsets, symmetric, noise):
-    option = 'TomographicAliasing = True\nAliasAwareReconstruction = True'
-    option += f'\nSymmetricAliasing = {symmetric}'
+    option = "ReconstructionModel = 'alias_aware'"
     if offsets is not None:
         option += f'\nGridOffsets = {offsets}'
     from configparser import ConfigParser
@@ -87,28 +70,3 @@ def test_covariance_and_estimator_match_direct_sampled_cells(tmp_path, offsets, 
     assert np.linalg.norm(model.W[ij]-expected)/np.linalg.norm(expected) < 3e-10
     residual = np.linalg.norm(model.W[ij] @ C-rhs)
     assert residual/(np.linalg.norm(model.W[ij])*np.linalg.norm(C)+np.linalg.norm(rhs)) < 1e-14
-
-
-@pytest.mark.parametrize('sampling', ['', 'GridOffsets = [[-.23,-.23],[.23,-.23],[.23,.23]]'])
-def test_reconstruction_is_independent_of_alias_propagation(tmp_path, sampling):
-    options = sampling+'\nAliasAwareReconstruction = True\nSymmetricAliasing = True'
-    native = _case(tmp_path/'native',options)
-    disabled = _case(tmp_path/'disabled',options+'\nTomographicAliasing = False')
-    propagated = _case(tmp_path/'propagated',options+'\nTomographicAliasing = True')
-    assert not native.tomographicAliasing and not disabled.tomographicAliasing
-    np.testing.assert_array_equal(native.PSD,disabled.PSD)
-    for field in ('Wtomo','W','Walpha','Popt','Cphi','Cphi_mod','MPalphaL',
-                  'h1','h2','hn','psdSpatioTemporal','psdNoise'):
-        np.testing.assert_array_equal(getattr(native,field),getattr(propagated,field))
-    stock_alias = (native.freq.mskInAO_*native._aliasing_psd_chunked()
-                   *native.ao.atm.r0**(-5/3)*0.0229)
-    np.testing.assert_array_equal(native.psdAlias,stock_alias)
-    assert not np.array_equal(native.psdAlias,propagated.psdAlias)
-
-
-@pytest.mark.parametrize('option',[
-    'AliasAwareReconstruction = 1\nTomographicAliasing = True',
-])
-def test_ambiguous_option_fails(tmp_path,option):
-    with pytest.raises(ValueError,match='AliasAwareReconstruction'):
-        _case(tmp_path,option)
