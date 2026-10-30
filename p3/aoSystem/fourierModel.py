@@ -58,6 +58,14 @@ class fourierModel:
     """
     Fourier class gathering the PSD calculation for PSF reconstruction and
     fast analytic simulations.
+
+    ``[RTC] TemporalModel_HO`` defaults to ``'integrator'`` (existing P3
+    behaviour). ``'polc'`` selects a queued leaky pseudo-open-loop response for
+    tomographic systems using ``TomographicAliasing=True``; its current alias
+    geometry requires equal-pitch SH WFSs and one ground-conjugate DM.
+    ``[sensor_HO] ExposureTime`` is a centered WFS integration duration in
+    seconds: zero is instantaneous; omitted/None uses detector clock/loop rate.
+    Explicit exposure currently supports multi-guide-star systems only.
     """
 
     # Minimum tomographic regularization, relative to the largest diagonal
@@ -203,6 +211,23 @@ class fourierModel:
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not nnp.isfinite(value) or value < 0):
             raise ValueError('sensor_HO.TomographicRegularizationFloor must be a finite nonnegative fraction')
+        # The default preserves the existing integrator calculations.
+        self.temporalModel = self.my_data_map.get('RTC', {}).get('TemporalModel_HO', 'integrator')
+        if self.temporalModel not in ('integrator', 'polc'):
+            raise ValueError("RTC.TemporalModel_HO must be 'integrator' or 'polc'")
+        self.exposureTime = self.my_data_map.get('sensor_HO', {}).get('ExposureTime')
+        if self.exposureTime is not None:
+            value = self.exposureTime
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not nnp.isfinite(value) or value < 0):
+                raise ValueError('sensor_HO.ExposureTime must be nonnegative seconds or None')
+        if self.temporalModel == 'polc':
+            rtc = self.ao.rtc.holoop
+            if (not nnp.isfinite(rtc['gain']) or not 0 <= rtc['gain'] <= 1
+                    or not nnp.isfinite(rtc['rate']) or rtc['rate'] <= 0
+                    or not nnp.isfinite(rtc['delay']) or rtc['delay'] < 0
+                    or rtc['delay'] != int(rtc['delay'])):
+                raise ValueError('POLC requires gain in [0,1], positive rate and a nonnegative integer delay')
         self.superResolution = self.my_data_map.get('sensor_HO', {}).get('SuperResolution', False)
         if not isinstance(self.superResolution, bool):
             raise ValueError('sensor_HO.SuperResolution must be True or False')
@@ -218,7 +243,6 @@ class fourierModel:
             raise ValueError('PhaseSamplesPerSubaperture is not supported by the continuous-cell model')
         if 'AliasOrder' in self.my_data_map.get('sensor_HO', {}):
             raise ValueError('AliasOrder is not supported by the frequency-local WFS model')
-
 
         self.t_initAO = 1000*(time.time() - tstart)
 
@@ -306,6 +330,12 @@ class fourierModel:
                 self.gs = self.ao.ngs
                 self.nGs = self.ao.ngs.nSrc
             self.wfsGridPhases = self._wfs_grid_phases()
+            if self.temporalModel == 'polc':
+                if not self.tomographicAliasing:
+                    raise ValueError('POLC currently requires TomographicAliasing = True')
+                self._validate_tomographic_aliasing()
+            if self.exposureTime is not None and self.nGs < 2:
+                raise ValueError('ExposureTime currently requires multiple WFSs')
             # Layers at or above a finite-altitude LGS are not sensed: they are
             # left uncorrected (open loop) instead of entering the cone
             # stretch 1/(1-h/z), which diverges at h=z and is negative above.
@@ -658,6 +688,36 @@ class fourierModel:
         return (bounds_down,bounds_up)
 
 #%% RECONSTRUCTOR DEFINITION
+    def _wfs_exposure_time(self, guide):
+        """Return the centered measurement duration in seconds for one WFS.
+
+        None retains the detector-clock/loop-rate duration; zero samples the
+        instantaneous phase. This does not change the command queue delay.
+        """
+        if self.exposureTime is not None:
+            return self.exposureTime
+        return self.ao.wfs.detector[guide].clock_rate/self.ao.rtc.holoop['rate']
+
+    def _polc_response(self, frequency):
+        """Applied command/input ratio for a leaky POL update and frame queue.
+
+        For exp(2*pi*i*f*t), frozen flow has f = -k.v. The delay is an
+        integer number of loop frames, independent of WFS exposure duration.
+        Assumes exact pseudo-open-loop subtraction of the applied DM command.
+        """
+        rtc = self.ao.rtc.holoop
+        p = np.exp(-2j*np.pi*np.asarray(frequency)/rtc['rate'])
+        if rtc['gain'] == 0:
+            return np.zeros_like(p)
+        return rtc['gain']*p**rtc['delay']/(1-(1-rtc['gain'])*p)
+
+    def _layer_temporal_frequencies(self, qx, qy):
+        """Frozen-flow frequency in Hz, with independent layers on the last axis."""
+        angle = np.asarray(self.ao.atm.wDir)*np.pi/180
+        vx = self.ao.atm.wSpeed*np.cos(angle)
+        vy = self.ao.atm.wSpeed*np.sin(angle)
+        return -(qx[..., None]*vx+qy[..., None]*vy)
+
     def _wfs_grid_phases(self):
         """Return per-guide sampling phases, or None for coincident grids.
 
@@ -746,7 +806,9 @@ class fourierModel:
                     Alpha = [self.gs.direction[0, g],self.gs.direction[1, g]]
                     fx = Alpha[0]*self.freq.kxAO_
                     fy = Alpha[1]*self.freq.kyAO_
-                    www = 2*i*np.pi*k * np.sinc(sampTime*clock_rate[g]*self.ao.atm.wSpeed[h]*freq_t)
+                    duration = (sampTime*clock_rate[g] if self.exposureTime is None
+                                else self.exposureTime)
+                    www = 2*i*np.pi*k * np.sinc(duration*self.ao.atm.wSpeed[h]*freq_t)
                     self.MPalphaL[:, :, g, h] = www*np.sinc(d_sub[g]*self.freq.kxAO_)\
                                                    *np.sinc(d_sub[g]*self.freq.kyAO_)\
                                                    *np.exp(i*2*np.pi*Hs[h]*(fx+fy))
@@ -1003,6 +1065,24 @@ class fourierModel:
         to the Taylor hypothesis : f = k.v
         """
         tstart  = time.time()
+
+        if self.temporalModel == 'polc':
+            frequency = self._layer_temporal_frequencies(self.freq.kxAO_, self.freq.kyAO_)
+            response = self._polc_response(frequency)
+            weights = self.sensedWeights/max(self.sensedWeights.sum(), nnp.finfo(float).tiny)
+            self.h1 = np.sum(weights*response, axis=-1)
+            self.h2 = np.sum(weights*abs(response)**2, axis=-1)
+            self.hn = self.h2.copy()
+            # White, independent measurement noise is filtered by the leaky
+            # update. A pure command delay changes phase, not integrated power.
+            gain = self.ao.rtc.holoop['gain']
+            self.noiseGain = gain/(2-gain)
+            f = np.logspace(-3, np.log10(0.5*self.ao.rtc.holoop['rate']), nF)
+            self.atfInt = self._polc_response(f)
+            self.rtfInt = 1-self.atfInt
+            self.ntfInt = self.atfInt.copy()
+            self.t_controller = 1000*(time.time()-tstart)
+            return
 
         if self.ao.rtc.holoop['gain']:
 
@@ -1320,6 +1400,8 @@ class fourierModel:
         clock_rate = np.array([self.ao.wfs.detector[j].clock_rate for j in range(self.nGs)])
         T = np.mean(clock_rate / self.ao.rtc.holoop['rate'])
         td = T * self.ao.rtc.holoop['delay']
+        if self.exposureTime is not None:
+            T = self.exposureTime
         vx = np.asarray(self.ao.atm.wSpeed * nnp.cos(self.ao.atm.wDir * np.pi / 180), dtype=self.dtype)
         vy = np.asarray(self.ao.atm.wSpeed * nnp.sin(self.ao.atm.wDir * np.pi / 180), dtype=self.dtype)
         weights = np.asarray(self.ao.atm.weights, dtype=self.dtype) * np.asarray(self.sensedLayers)
@@ -1532,9 +1614,11 @@ class fourierModel:
         """Propagate aliases through the configured tomographic estimator.
 
         Use the scalar slope projected onto the target frequency. Keep the
-        ordinary alias comb, normalization and averaged temporal factor;
-        replace only the spatial Rx/Ry inverse with W. Layers are independent,
-        while each layer's alias is shared among guide stars.
+        ordinary alias comb, normalization and averaged
+        temporal factor for the integrator; replace only the spatial Rx/Ry inverse with W. POLC
+        applies exposure and controller response per physical alias and layer
+        before squaring, without averaging independent layer amplitudes. Layers
+        are independent, while each layer's alias is shared among guide stars.
         Currently supports equal SH pitches and one ground-conjugate DM.
         """
         self._validate_tomographic_aliasing()
@@ -1547,6 +1631,7 @@ class fourierModel:
                              [[0., 0.]]*self.nGs), dtype=self.dtype)
         heights = self.ao.atm.heights*self.strechFactor
         power = np.zeros_like(kx)
+        durations = np.asarray([self._wfs_exposure_time(g) for g in range(self.nGs)])
         for m, n in zip(mx, my):
             qx, qy = kx-m/d, ky-n/d
             cell_gradient = self._scalar_wfs_gradient(qx, qy, ux, uy, d)
@@ -1554,24 +1639,36 @@ class fourierModel:
             if self.wfsGridPhases is not None:
                 shift = d*(qx[:, None]*offsets[:, 0]+qy[:, None]*offsets[:, 1])
                 sampled_estimator = estimator*np.exp(2j*np.pi*shift)
-            temporal = np.sum(weights[:, None]*np.sinc(qx[None]*vx[:, None]*T)
-                              * np.sinc(qy[None]*vy[:, None]*T)
-                              * np.exp(2j*np.pi*(qx[None]*vx[:, None]
-                                                + qy[None]*vy[:, None])*td), axis=0)*tf
+            # Preserve the default integrator's averaged factor exactly.
+            if self.temporalModel == 'polc':
+                frequency = self._layer_temporal_frequencies(qx, qy)
+                transfer = self._polc_response(frequency)
+            else:
+                temporal = np.sum(weights[:, None]*np.sinc(qx[None]*vx[:, None]*T)
+                                  * np.sinc(qy[None]*vy[:, None]*T)
+                                  * np.exp(2j*np.pi*(qx[None]*vx[:, None]
+                                                    + qy[None]*vy[:, None])*td), axis=0)*tf
             variance = np.zeros_like(kx)
             for layer, height in enumerate(heights):
                 if not self.sensedLayers[layer]:
                     continue
                 angle = qx[:, None]*self.gs.direction[0] + qy[:, None]*self.gs.direction[1]
                 measurement = np.exp(2j*np.pi*height*angle)
+                if self.temporalModel == 'polc':
+                    measurement *= np.sinc(frequency[:, layer, None]*durations)
                 response = np.sum(sampled_estimator*measurement, axis=-1)*cell_gradient
+                if self.temporalModel == 'polc':
+                    response *= transfer[:, layer]
                 variance += weights[layer]*np.abs(response)**2
             spectrum = (qx*qx+qy*qy+1/self.ao.atm.L0**2)**(-11/6)
             piston = FourierUtils.pistonFilter(self.ao.tel.D, np.hypot(qx, qy).reshape(
                 self.freq.kxAO_.shape), dtype=self.dtype).ravel()
             if not piston_filter:
                 piston = (qx != 0) | (qy != 0)
-            power += piston*spectrum*variance*np.abs(temporal)**2
+            if self.temporalModel == 'polc':
+                power += piston*spectrum*variance
+            else:
+                power += piston*spectrum*variance*np.abs(temporal)**2
         return (power.reshape(self.freq.kxAO_.shape)*self.freq.mskInAO_
                 * self.ao.atm.r0**(-5/3)*0.0229)
 
@@ -1626,7 +1723,10 @@ class fourierModel:
                 (self.freq.resAO, self.freq.resAO, self.ao.src.nSrc)
         psd = np.zeros(shape, dtype=self.dtype)
         mean_noise_var = np.asarray(self.ao.wfs.processing.noiseVar, dtype=self.dtype).mean()
-        if float(self.ao.wfs.processing.noiseVar[0]) > 0:
+        has_noise = (bool(np.any(self.ao.wfs.processing.noiseVar > 0))
+                     if self.temporalModel == 'polc'
+                     else float(self.ao.wfs.processing.noiseVar[0]) > 0)
+        if has_noise:
             if self.nGs < 2:
                 # SCAO case
                 psd = abs(self.Rx**2 + self.Ry**2)
@@ -1647,6 +1747,8 @@ class fourierModel:
                 #   an integrator controller with a gain of 0.5.
                 #   The linear value ranges from 0.4 to 0.8 for a delay from 0 to 3 frames.
                 noise_gain = min(0.8, 0.4 + 0.1333 * self.ao.rtc.holoop['delay']) ** 2
+                if self.temporalModel == 'polc':
+                    noise_gain = self.noiseGain
                 noise_var = np.asarray(self.ao.wfs.processing.noiseVar, dtype=self.dtype)
                 
                 for j in range(self.ao.src.nSrc):
@@ -1774,6 +1876,9 @@ class fourierModel:
                 covariance = np.divide(self.Cphi, pf, out=np.zeros_like(self.Cphi), where=pf > 0)
         F = self.Rx*self.SxAv + self.Ry*self.SyAv
         two_pi_i = 2 * i * np.pi
+        if self.temporalModel == 'polc':
+            temporal = self._polc_response(
+                self._layer_temporal_frequencies(self.freq.kxAO_, self.freq.kyAO_))
 
         for s in range(self.ao.src.nSrc):
             if self.nGs<2:
@@ -1819,7 +1924,11 @@ class fourierModel:
                 
                 PbetaL = np.exp(two_pi_i * delta_h)
 
-                proj = PbetaL - np.matmul(self.PbetaDM[s], self.Walpha)
+                if self.temporalModel == 'polc':
+                    PbetaL = np.exp(two_pi_i*Hs[None, None, None, :]*(fx+fy)[:, :, None, None])
+                    proj = PbetaL - np.matmul(self.PbetaDM[s], self.Walpha)*temporal[:, :, None, :]
+                else:
+                    proj = PbetaL - np.matmul(self.PbetaDM[s], self.Walpha)
                 
                 # Cphi is now a 3D diagonal array (nK, nK, nL).
                 # proj @ Cphi @ proj_T massively simplifies to element-wise broadcasting:
