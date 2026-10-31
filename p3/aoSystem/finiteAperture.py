@@ -29,6 +29,8 @@ def input_signature(native):
                    native.freq.kxAO_, native.freq.kyAO_, native.gs.height,
                    native.gs.direction, native.ao.src.direction, native.ao.src.wvl,
                    native.ao.atm.r0, native.ao.atm.L0, native.ao.tel.D,
+                   [native.ao.tel.extraErrorNm, native.ao.tel.extraErrorExp,
+                    native.ao.tel.extraErrorMin, native.ao.tel.extraErrorMax],
                    native.strechFactor, native.ao.dms.opt_dir, native.ao.dms.opt_weights,
                    [w.dsub for w in native.ao.wfs.optics],
                    [native.freq.nOtf, native.freq.resAO, native.freq.kcMax_,
@@ -54,12 +56,21 @@ def _fold(spectrum, n):
     return result
 
 
-def _stationary(power, kernels, sampling, size):
+def _stationary_terms(power, kernels, sampling, size):
     c = fft.ifft2(_fold(power, size)).real*size**2
     cross = np.array([fft.ifft2(_fold(power*k.conj(), size)).real*size**2 for k in kernels])
     tilt = np.einsum('xy,ixy,jxy->ij', power, kernels, kernels.conj()).real
     y, x = (sampling.ys-sampling.n//2) % size, (sampling.xs-sampling.n//2) % size
     points = cross[:, y, x]
+    return c, points, tilt
+
+
+def _stationary(power, kernels, sampling, size):
+    c, points, tilt = _stationary_terms(power, kernels, sampling, size)
+    return _stationary_matrix(c, points, tilt, sampling)
+
+
+def _stationary_matrix(c, points, tilt, sampling):
     result = sampling.covariance_from_lags(c)
     result -= sampling.ramps.T@points
     result -= points.T@sampling.ramps
@@ -119,6 +130,65 @@ class _ScienceMeasurementQuery:
                 output[axis, points] = values.ravel()[indices]
 
 
+class FiniteResidualCovariance:
+    """One field's complete residual, evaluated in bounded upper row strips.
+
+    Arrays from the reconstruction/optics cache are held by reference and
+    never changed. Science--measurement cross covariance and independent
+    stationary moments belong to this field. The residual retains incoming,
+    correction and both science--correction terms. It is not a low-rank or
+    diagonal approximation. ``diagonal`` and every block use radians squared.
+    """
+
+    def __init__(self, sampling, source, correction, additional, cross, operator, independent):
+        self.sampling = sampling
+        self.correction = correction; self.additional = additional
+        self.cross = cross; self.operator = operator
+        # Pupil fitting is linear. Sum stationary moments before projection,
+        # retaining the complete incoming source without a dense source matrix.
+        self.lags, self.points, self.tilt = (a+b for a,b in zip(source,independent))
+        ramps = sampling.ramps
+        diagonal = np.full(len(sampling.xs), self.lags[0,0])
+        diagonal -= np.sum(ramps*self.points,axis=0)
+        diagonal -= np.sum(self.points*ramps,axis=0)
+        diagonal += np.sum((ramps.T@self.tilt)*ramps.T,axis=1)
+        if additional is not None: diagonal += np.diag(additional)
+        diagonal += correction.diagonal()
+        sc = np.einsum('ij,ij->i',cross,operator)
+        diagonal -= sc; diagonal -= sc
+        self.diagonal = diagonal
+
+    def blocks(self, rows=None):
+        """Yield ``(first, covariance[first:last, first:])`` without full intermediates.
+
+        Rows bound temporary storage; all columns at or above each row are
+        evaluated. The small lower triangle within a strip is also supplied.
+        New reconstruction/optical inputs require a new residual object.
+        """
+        if rows is None:
+            # At most 64 MiB per dense strip, with a 512-row BLAS tile.
+            rows = max(1,min(512,(64*1024**2)//(8*len(self.diagonal))))
+        if not isinstance(rows,int) or rows <= 0:
+            raise ValueError('Covariance block rows must be a positive integer')
+        ramps = self.sampling.ramps
+        for first in range(0,len(self.diagonal),rows):
+            last = min(first+rows,len(self.diagonal)); r = slice(first,last); c = slice(first,None)
+            independent = self.sampling.covariance_from_lags(self.lags,r,c)
+            independent -= ramps[:,r].T@self.points[:,c]
+            independent -= self.points[:,r].T@ramps[:,c]
+            independent += (ramps[:,r].T@self.tilt)@ramps[:,c]
+            covariance = independent
+            if self.additional is not None: covariance += self.additional[r,c]
+            covariance += self.correction[r,c]
+            covariance -= self.cross[r]@self.operator[c].T
+            covariance -= self.operator[r]@self.cross[c].T
+            # Dot-product ordering differs between diagonal and blocked GEMM.
+            # One shared diagonal enforces the exact zero-separation identity.
+            index = np.arange(last-first)
+            covariance[index,index] = self.diagonal[r]
+            yield first,covariance
+
+
 def validate_native(native):
     """Reject combinations outside this candidate's tested physical contract."""
     sensor = native.my_data_map.get('sensor_HO', {})
@@ -136,11 +206,8 @@ def validate_native(native):
         raise ValueError('ReconstructionModel=finite_aperture requires equal-height LGSs above every layer')
     if len(native.atm_mod.heights) != len(native.ao.atm.heights):
         raise ValueError('ReconstructionModel=finite_aperture currently requires all physical reconstruction layers')
-    if native.ao.windPsdFile != 0 or native.ao.tel.extraErrorNm != 0:
-        raise ValueError('ReconstructionModel=finite_aperture has not been validated with vibration or additional errors')
-    opd = native.ao.tel.opdMap_on
-    if opd is not None and np.any(opd):
-        raise ValueError('ReconstructionModel=finite_aperture currently requires NCPA off')
+    if native.ao.windPsdFile != 0:
+        raise ValueError('ReconstructionModel=finite_aperture has not been validated with vibration')
     if not isinstance(native.freq.kxAO_, np.ndarray):
         raise ValueError('ReconstructionModel=finite_aperture is currently CPU-only')
 
@@ -294,10 +361,19 @@ class FiniteApertureReconstructor:
                 self.normal_equation_error = float(np.linalg.norm(w@self.cov_regular-target)/np.linalg.norm(target))
         self.timings['reconstruction_seconds'] = time.perf_counter()-started
 
-    def prepare_optics(self, sampling):
+    @property
+    def source(self):
+        """Materialize the source only for callers of the dense covariance API."""
+        if self._source_covariance is None:
+            self._source_covariance = _stationary_matrix(*self.source_terms,self._source_sampling)
+        return self._source_covariance
+
+    def prepare_optics(self, sampling, dense_source=True):
         """Prepare/cache correction and science covariance for one optical grid."""
         key = (sampling.n, sampling.native_n, sampling.native_side, sampling.period, sampling.signature)
-        if self._sampling == key: return
+        if self._sampling == key:
+            if dense_source: _ = self.source
+            return
         started = time.perf_counter()
         if sampling.native_n != self.native_n or not np.isclose(sampling.period, self.period):
             raise ValueError('Finite-aperture optics and reconstruction must share the physical Fourier period')
@@ -315,7 +391,10 @@ class FiniteApertureReconstructor:
             if abs(values.imag).max() > 2e-7: raise ValueError('Non-real finite-aperture command surface')
             self.operator[:, sl] = values.real-sampling.ramps.T@(moments@w).real
         self.correction = (self.operator@self.cov_raw)@self.operator.T
-        self.source = _stationary(self.raw.sum(0)*self.dk**2, self.kernels, sampling, sampling.n)
+        self.source_terms = _stationary_terms(self.raw.sum(0)*self.dk**2, self.kernels, sampling, sampling.n)
+        self._source_sampling = sampling
+        self._source_covariance = None
+        if dense_source: _ = self.source
         # Factor only this known stationary high-frequency science term from
         # optical quadrature. All of its fitted-tilt and correction cross terms
         # remain in the full covariance. This is an algebraic factorization,
@@ -343,6 +422,14 @@ class FiniteApertureReconstructor:
         wavelength = float(self.native.ao.src.wvl[0])
         conversion = (np.pi/wavelength*self.native_n*self.native.freq.PSDstep/self.native.freq.dk_)**2
         self.aux_conversion = norm*conversion/self.native_n**2
+        self.additional_covariance = None
+        if self.native.ao.tel.extraErrorNm > 0:
+            # Reuse ordinary P3's independent additional-error spectrum and
+            # normalization, with the same original-pupil tilt projection.
+            power = self.native.extraErrorPSD()*self.aux_conversion
+            self.additional_covariance = _stationary(power, self.aux_kernels, sampling, sampling.n)
+            self.stationary_high_lags = tuple(previous+fft.ifft2(_fold(power, n)).real*n**2
+                for previous, n in zip(self.stationary_high_lags, (sampling.n, self.native_n)))
         query_started = time.perf_counter()
         self._science_query = _ScienceMeasurementQuery(
             sampling.xy, self.cells, self.kernel_grid, self.period)
@@ -353,6 +440,21 @@ class FiniteApertureReconstructor:
     def residual_covariance(self, sampling, field):
         """Raw residual covariance after fitted-pupil tilt, in radians squared."""
         self.prepare_optics(sampling)
+        started = time.perf_counter()
+        cross,query_seconds = self._science_measurement_cross(sampling,field)
+        independent = _stationary(self._independent_power(field), self.aux_kernels, sampling, sampling.n)
+        sc = cross@self.operator.T
+        covariance = self.source.copy()
+        covariance += independent
+        if self.additional_covariance is not None:
+            covariance += self.additional_covariance
+        covariance += self.correction
+        covariance -= sc
+        covariance -= sc.T
+        return covariance, dict(science_measurement_seconds=query_seconds,
+            residual_covariance_seconds=time.perf_counter()-started)
+
+    def _science_measurement_cross(self, sampling, field):
         started = time.perf_counter(); beta = self.native.ao.src.direction[:, field]
         cross = np.zeros((len(sampling.xs), self.nc*self.nv))
         values = np.empty((2, len(sampling.xs), self.nv))
@@ -367,15 +469,20 @@ class FiniteApertureReconstructor:
                     fit = np.array([ndimage.map_coordinates(kernel[i, j], base, order=3, mode='grid-wrap', prefilter=False) for i in (1, 2)])
                     values[j] -= sampling.ramps.T@fit
                     cross[:, (2*guide+j)*self.nv:(2*guide+j+1)*self.nv] += values[j]
-        query_seconds = time.perf_counter()-started
+        return cross,time.perf_counter()-started
+
+    def _independent_power(self, field):
         extra = np.zeros((self.native_n, self.native_n)); first = self.ao_start
         extra[first:first+self.native.freq.resAO, first:first+self.native.freq.resAO] = self.auxiliary[:, :, field]*self.aux_conversion
-        independent = _stationary(extra, self.aux_kernels, sampling, sampling.n)
-        sc = cross@self.operator.T
-        covariance = self.source.copy()
-        covariance += independent
-        covariance += self.correction
-        covariance -= sc
-        covariance -= sc.T
-        return covariance, dict(science_measurement_seconds=query_seconds,
+        return extra
+
+    def residual_blocks(self, sampling, field):
+        """Return the same physical residual as factors and bounded covariance blocks."""
+        self.prepare_optics(sampling,dense_source=False)
+        started = time.perf_counter()
+        cross,query_seconds = self._science_measurement_cross(sampling,field)
+        independent = _stationary_terms(self._independent_power(field),self.aux_kernels,sampling,sampling.n)
+        residual = FiniteResidualCovariance(sampling,self.source_terms,self.correction,
+            self.additional_covariance,cross,self.operator,independent)
+        return residual,dict(science_measurement_seconds=query_seconds,
             residual_covariance_seconds=time.perf_counter()-started)

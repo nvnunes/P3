@@ -645,6 +645,9 @@ class fourierModel:
         No diagonal atmospheric PSD is computed or added to this covariance. Geometry/atmosphere/configuration changes
         invalidate this instance's reconstruction cache before prediction.
         """
+        return self._finite_aperture_backend().residual_covariance(sampling, field)
+
+    def _finite_aperture_backend(self):
         if not self.finiteApertureReconstruction:
             raise ValueError("ReconstructionModel='finite_aperture' is disabled")
         from .finiteAperture import FiniteApertureReconstructor, input_signature, validate_native
@@ -652,7 +655,17 @@ class fourierModel:
         signature = input_signature(self)
         if self.finiteApertureBackend is None or self.finiteApertureBackend.signature != signature:
             self.finiteApertureBackend = FiniteApertureReconstructor(self)
-        return self.finiteApertureBackend.residual_covariance(sampling, field)
+        return self.finiteApertureBackend
+
+    def finite_aperture_residual(self, sampling, field):
+        """Return the complete fitted-pupil residual as upper covariance blocks.
+
+        Reconstruction, physical inputs and all cross terms are identical to
+        ``finite_aperture_covariance``. The returned object owns this field's
+        measurement queries and exposes ``diagonal`` and ``blocks(rows)``;
+        no dense field covariance is materialized. Units are radians squared.
+        """
+        return self._finite_aperture_backend().residual_blocks(sampling,field)
 
     def _sensed_layers_mask(self, heights) -> nnp.ndarray:
         """Boolean mask of the layers seen by the HO guide star (all of them for NGS)."""

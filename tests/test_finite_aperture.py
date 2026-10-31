@@ -150,3 +150,70 @@ def test_periodic_full_coverage_has_frequency_local_limit(tmp_path):
     error = np.trace(difference@k@difference.conj().T).real
     scale = np.trace(global_weights@k@global_weights.conj().T).real
     assert error/scale < 1e-14
+
+
+def test_builtin_extra_error_uses_same_stationary_pupil_fit_optics(tmp_path):
+    from mastsel import psdSetToPsfSet
+    from tiptop.finite_pupil import FinitePupilSampling
+    model=small_model(tmp_path/'case', True)
+    n=model.freq.nOtf;side=int(2*np.round(float(model.ao.tel.D)/2*n*model.freq.PSDstep))
+    period=1/float(model.freq.kxAO_[1,0]-model.freq.kxAO_[0,0])
+    sample=FinitePupilSampling(model.ao.tel.pupil,n,side,period,optical_n=n)
+    baseline, _ = model.finite_aperture_covariance(sample,0)
+    original=model.finiteApertureBackend.weights.copy()
+    model.ao.tel.extraErrorNm=129.46549607941247
+    extended, _ = model.finite_aperture_covariance(sample,0)
+    backend=model.finiteApertureBackend
+    np.testing.assert_array_equal(original,backend.weights)
+    np.testing.assert_allclose(extended-baseline, backend.additional_covariance, atol=2e-13, rtol=1e-11)
+    actual,_=sample.psf(backend.additional_covariance)
+    norm=(2*model.freq.kcMax_/model.freq.resAO*model.freq.wvlRef*1e9/(2*np.pi))**2
+    nm2=model.extraErrorPSD()*norm
+    np.testing.assert_allclose(nm2.sum(),model.ao.tel.extraErrorNm**2,rtol=2e-15)
+    expected=psdSetToPsfSet([nm2],model.ao.tel.pupil,[model.freq.wvlRef],
+        nPixPup=side,freq_range=n*model.freq.PSDstep,dk=model.freq.dk_,
+        nPixPsf=n,oversampling=1,full_flux=True,tip_tilt_removal='pupil_fit')[0].sampling
+    np.testing.assert_allclose(actual,expected,atol=2e-14,rtol=2e-10)
+
+
+def test_static_phase_does_not_change_reconstruction_or_dynamic_covariance(tmp_path):
+    from tiptop.finite_pupil import FinitePupilSampling
+    model = small_model(tmp_path/'case',True)
+    n = model.freq.nOtf
+    side = int(2*np.round(float(model.ao.tel.D)/2*n*model.freq.PSDstep))
+    period = 1/float(model.freq.kxAO_[1,0]-model.freq.kxAO_[0,0])
+    sampling = FinitePupilSampling(model.ao.tel.pupil,n,side,period)
+    before,_ = model.finite_aperture_covariance(sampling,0)
+    backend = model.finiteApertureBackend
+    model.ao.tel.opdMap_on = np.sin(np.indices(model.ao.tel.pupil.shape)[0])*80
+    after,_ = model.finite_aperture_covariance(sampling,0)
+    assert model.finiteApertureBackend is backend
+    np.testing.assert_array_equal(before,after)
+
+
+@pytest.mark.parametrize('extra_error_nm', [0., 40.])
+def test_residual_blocks_match_dense_covariance_and_keep_cache_ownership(tmp_path, extra_error_nm):
+    from tiptop.finite_pupil import FinitePupilSampling
+    model=small_model(tmp_path/'case',True)
+    model.ao.tel.extraErrorNm=extra_error_nm
+    n=model.freq.nOtf
+    side=int(2*np.round(float(model.ao.tel.D)/2*n*model.freq.PSDstep))
+    period=1/float(model.freq.kxAO_[1,0]-model.freq.kxAO_[0,0])
+    pupil=model.ao.tel.pupil
+    phase=.2*np.sin(np.indices(pupil.shape)[0])
+    sample=FinitePupilSampling(pupil,n,side,period,static_phase=phase)
+    residual,_=model.finite_aperture_residual(sample,0)
+    assert model.finiteApertureBackend._source_covariance is None
+    snapshots=[(first,block.copy()) for first,block in residual.blocks(7)]
+    assert model.finiteApertureBackend._source_covariance is None
+    dense,_=model.finite_aperture_covariance(sample,0)
+    np.testing.assert_allclose(residual.diagonal,np.diag(dense),atol=2e-12,rtol=2e-12)
+    for first,block in snapshots:
+        np.testing.assert_allclose(block,dense[first:first+len(block),first:],atol=2e-12,rtol=2e-12)
+    a,_=sample.psf(dense)
+    b,_=sample.psf_blocks(residual.diagonal,residual.blocks(7))
+    np.testing.assert_allclose(a,b,atol=2e-13,rtol=2e-10)
+    other=FinitePupilSampling(pupil,n,side,period)
+    model.finite_aperture_covariance(other,0)
+    for (_,saved),(_,block) in zip(snapshots,residual.blocks(7),strict=True):
+        np.testing.assert_array_equal(block,saved)

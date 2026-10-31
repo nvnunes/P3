@@ -50,7 +50,7 @@ def test_finite_model_does_not_execute_the_alternative(tmp_path):
 
 @pytest.mark.parametrize('setting,value,message', [
     ('noise', .01, 'noise'), ('temporal', 'integrator', 'POLC'),
-    ('exposure', .001, 'instantaneous'), ('ncpa', 1., 'NCPA'),
+    ('exposure', .001, 'instantaneous'),
     ('layers', None, 'all physical reconstruction layers'),
 ])
 def test_finite_scope_does_not_broaden(tmp_path, setting, value, message):
@@ -59,7 +59,6 @@ def test_finite_scope_does_not_broaden(tmp_path, setting, value, message):
     if setting == 'noise': model.ao.wfs.processing.noiseVar[0] = value
     elif setting == 'temporal': model.temporalModel = value
     elif setting == 'exposure': model.exposureTime = value
-    elif setting == 'ncpa': model.ao.tel.opdMap_on = np.ones((4, 4))*value
     elif setting == 'layers': model.atm_mod.heights = model.atm_mod.heights[:1]
     with pytest.raises(ValueError, match=message): validate_native(model)
 
