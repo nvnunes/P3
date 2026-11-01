@@ -16,6 +16,7 @@ from scipy.linalg import cho_factor, cho_solve
 from scipy.sparse import csr_matrix
 
 from .FourierUtils import pistonFilter
+from .atmosphericTail import AtmosphericTail
 
 
 def input_signature(native):
@@ -392,6 +393,12 @@ class FiniteApertureReconstructor:
             self.operator[:, sl] = values.real-sampling.ramps.T@(moments@w).real
         self.correction = (self.operator@self.cov_raw)@self.operator.T
         self.source_terms = _stationary_terms(self.raw.sum(0)*self.dk**2, self.kernels, sampling, sampling.n)
+        tail_started = time.perf_counter()
+        self.atmospheric_tail = AtmosphericTail(self.native.ao.atm.r0,
+            self.native.ao.atm.L0, self.dk, self.count, sampling.n, symmetric_source=True)
+        tail_terms = self.atmospheric_tail.fitted_moments(sampling)
+        self.source_terms = tuple(a+b for a,b in zip(self.source_terms,tail_terms))
+        self.timings['atmospheric_tail_seconds'] = time.perf_counter()-tail_started
         self._source_sampling = sampling
         self._source_covariance = None
         if dense_source: _ = self.source
@@ -402,6 +409,15 @@ class FiniteApertureReconstructor:
         high = self.raw.sum(0)*self.dk**2*(np.hypot(self.qx, self.qy) > self.native.freq.kcMax_)
         self.stationary_high_lags = tuple(fft.ifft2(_fold(high, n)).real*n**2
             for n in (sampling.n, sampling.native_n))
+        # The native blocked optics consume source_terms. The reduced-grid
+        # diagnostic path also factors this same stationary source completion.
+        if sampling.n == sampling.native_n:
+            self.stationary_high_lags = tuple(c+tail_terms[0] for c in self.stationary_high_lags)
+        else:
+            native_tail = AtmosphericTail(self.native.ao.atm.r0,self.native.ao.atm.L0,
+                self.dk,self.count,sampling.native_n,symmetric_source=True)
+            self.stationary_high_lags = (self.stationary_high_lags[0]+tail_terms[0],
+                self.stationary_high_lags[1]+native_tail.covariance())
         self.kernel_grid = 2**int(np.ceil(np.log2(max(self.count, 4*self.native_n))))
         self.interpolation = []
         for layer in range(len(self.heights)):

@@ -20,6 +20,7 @@ from shutil import which
 import p3.aoSystem.FourierUtils as FourierUtils
 from p3.aoSystem.aoSystem import aoSystem
 from p3.aoSystem.atmosphere import atmosphere
+from p3.aoSystem.atmosphericTail import AtmosphericTail
 from p3.aoSystem.frequencyDomain import frequencyDomain
 from p3.aoSystem.airRefraction import MatharAirRefraction
 from p3.aoSystem.processing import is_auto_noise_var
@@ -1301,9 +1302,13 @@ class fourierModel:
             k = np.sqrt(self.freq.k2_)
             pf = FourierUtils.pistonFilter(self.ao.tel.D, k, dtype=self.dtype)
             psd = self.ao.atm.spectrum(k) * pf
+            if self.reconstructionModel == 'alias_aware':
+                psd += self._unresolved_atmospheric_psd()
             psd = psd[:, :, np.newaxis]
             if self.computeOpticalPSD:
                 self.opticalPSD = (self.ao.atm.spectrum(k)*(k != 0))[:, :, np.newaxis] * (dk*rad2nm)**2
+                if self.reconstructionModel == 'alias_aware':
+                    self.opticalPSD += self._unresolved_atmospheric_psd()[:, :, None]*(dk*rad2nm)**2
         else:
             # CLOSED-LOOP
             psd = np.zeros((self.freq.nOtf,self.freq.nOtf,self.ao.src.nSrc),
@@ -1492,8 +1497,24 @@ class fourierModel:
         psd = np.zeros((self.freq.nOtf,self.freq.nOtf),
                        dtype=self.dtype)
         psd[self.freq.mskOut_]  = self.ao.atm.spectrum(np.sqrt(self.freq.k2_[self.freq.mskOut_]))
+        if self.reconstructionModel == 'alias_aware':
+            psd += self._unresolved_atmospheric_psd()
         self.t_fittingPSD = 1000*(time.time() - tstart)
         return psd
+
+    def _unresolved_atmospheric_psd(self):
+        """Fold unresolved source power onto the existing fast optical grid.
+
+        This is independent fitting power, not additional sensed aliases or a
+        change to the inverse. Pupil-fit optics keep their native-grid spectral
+        projection; finite aperture retains original-frequency fit moments.
+        """
+        dk = float(cpuArray(self.freq.kx_[1,0]-self.freq.kx_[0,0]))
+        key = (float(self.ao.atm.r0), float(self.ao.atm.L0), dk, int(self.freq.nOtf))
+        if getattr(self, '_atmospheric_tail_key', None) != key:
+            self.atmosphericTail = AtmosphericTail(*key[:3], key[3], key[3])
+            self._atmospheric_tail_key = key
+        return np.asarray(nnp.fft.fftshift(self.atmosphericTail.power).T/dk**2,dtype=self.dtype)
 
     def _alias_shift_grid(self):
         """Return alias indices, optionally retaining both outer replicas."""
