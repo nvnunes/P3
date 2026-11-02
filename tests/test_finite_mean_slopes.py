@@ -65,7 +65,7 @@ def test_projected_disabled_science_is_the_single_stage_limit(tmp_path):
     native.removeMeanSlopes=True;native.my_data_map['RTC_science']['LoopGain_HO']=0.
     sample=sampling(native)
     actual,_=native.finite_aperture_covariance(sample,0)
-    assert isinstance(native.finiteApertureBackend,FiniteActuatorReconstructor)
+    assert isinstance(native._finiteApertureReconstructor,FiniteActuatorReconstructor)
     single=FiniteActuatorReconstructor(native)
     expected,_=single.residual_covariance(sample,0)
     np.testing.assert_array_equal(actual,expected)

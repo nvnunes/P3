@@ -77,3 +77,12 @@ def configuration(config, model):
     if gain > 0 and model not in ('alias_aware', 'finite_aperture'):
         raise ValueError('Science correction requires alias_aware or finite_aperture')
     return ScienceCorrection(pitch, actuators, gain, delay), regularization
+
+
+def covariance_backend(value, model, science):
+    """Validate execution policy; GPU products currently accelerate two-stage finite optics."""
+    if not isinstance(value, str) or value not in ('numpy', 'cuda', 'mps'):
+        raise ValueError("finiteApertureBackend must be 'numpy', 'cuda' or 'mps'")
+    if value != 'numpy' and (model != 'finite_aperture' or science is None or not science.active):
+        raise ValueError(f'finiteApertureBackend={value} requires active finite-aperture science correction')
+    return value

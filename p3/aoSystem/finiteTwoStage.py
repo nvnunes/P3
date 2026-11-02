@@ -34,6 +34,7 @@ class FiniteTwoStageReconstructor(FiniteActuatorReconstructor):
             raise ValueError('Finite science pitch must be >= common pitch')
         if native.ao.rtc.holoop['gain'] <= 0:
             raise ValueError('Finite two-stage MOAO requires an active common loop')
+        self.array_backend = native.finiteApertureBackend
         self.science_surface = GaussianSurface(native.my_data_map['DM_science'],
             self.cells, self.pitch, native.ao.tel.pupil, native.ao.resolve_path,
             diameter=float(native.ao.tel.D), actuators=self.stage.actuators,
@@ -91,6 +92,13 @@ class FiniteTwoStageReconstructor(FiniteActuatorReconstructor):
                     c = fft.ifft2(_fold(density*multiplier,self.kernel_grid)).real*self.kernel_grid**2
                     values[i,j] = ndimage.spline_filter(c,order=3,mode='grid-wrap')
             self.raw_interpolation.append(values)
+        if self.array_backend=='cuda':
+            from .finiteTwoStageCupy import CupyFiniteProducts
+            self.device = CupyFiniteProducts(self,sampling)
+        elif self.array_backend=='mps':
+            from .finiteTwoStageMps import MpsFiniteProducts
+            self.device = MpsFiniteProducts(self,sampling)
+        else: self.device = None
         self._coupled_sampling = self._sampling
         self.timings['coupled_optical_preparation_seconds'] = time.perf_counter()-started
 
@@ -101,6 +109,7 @@ class FiniteTwoStageReconstructor(FiniteActuatorReconstructor):
         return self.science_basis @ rows
 
     def _query_crosses(self,sampling,field):
+        if self.device is not None: return self.device.crosses(field)
         beta = self.native.ao.src.direction[:,field]
         cross = np.zeros((3,len(sampling.xs),self.nc*self.nv))
         values = np.empty((2,len(sampling.xs),self.nv))
@@ -130,18 +139,24 @@ class FiniteTwoStageReconstructor(FiniteActuatorReconstructor):
         target=self.science_surface.fit@self._prior_cross(field)
         rows=cho_solve(self.factor,target.T,check_finite=False).T
         basis=self.science_basis
-        operator=basis@rows
+        operator=basis@rows if self.device is None else None
         operator_seconds = time.perf_counter()-before
         independent = _stationary_terms(self._independent_power(field),self.aux_kernels,sampling,sampling.n)
-        common,science,product = crosses
-        update = .5*(operator@self.cbb)+self.common_science_cross-science+product@self.feedback.T
-        update=update@rows.T
-        operator=basis
-        common=common@self.weights.T
+        if self.device is None:
+            common,science,product = crosses
+            update = .5*(operator@self.cbb)+self.common_science_cross-science+product@self.feedback.T
+            update=update@rows.T
+            operator=basis
+            common=common@self.weights.T
+            device = None
+        else:
+            common,device = self.device.context(crosses,rows,basis)
+            operator=basis
+            update = None
         common_operator=self.common_basis
         base = FiniteResidualCovariance(sampling,self.source_terms,self.correction,
             self.additional_covariance,common,common_operator,independent)
-        residual = CoupledFiniteResidual(base,operator,update)
+        residual = CoupledFiniteResidual(base,operator,update,device)
         profile=dict(science_measurement_seconds=query_seconds,
             science_operator_seconds=operator_seconds,residual_covariance_seconds=time.perf_counter()-started)
         return self._project_measurement_means(residual,sampling,field,profile)

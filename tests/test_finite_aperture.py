@@ -66,7 +66,7 @@ def test_omitted_false_preserve_native_predictions(tmp_path):
     assert not omitted.finiteApertureReconstruction
     for name in ('W', 'PSD', 'opticalPSD'):
         np.testing.assert_array_equal(getattr(omitted, name), getattr(false, name))
-    assert omitted.finiteApertureBackend is None
+    assert omitted._finiteApertureReconstructor is None
     with pytest.raises(ValueError, match='disabled'): omitted.finite_aperture_covariance(None, 0)
 
 
@@ -90,10 +90,10 @@ def test_real_covariance_cache_reuse_and_invalidation(tmp_path):
     period = 1/float(model.freq.kxAO_[1,0]-model.freq.kxAO_[0,0])
     sampling = optics.FinitePupilSampling(model.ao.tel.pupil, model.freq.nOtf, side, period)
     a, _ = model.finite_aperture_covariance(sampling, 0)
-    backend = model.finiteApertureBackend
+    backend = model._finiteApertureReconstructor
     b, _ = model.finite_aperture_covariance(sampling, 0)
     np.testing.assert_array_equal(a, b)
-    assert backend is model.finiteApertureBackend
+    assert backend is model._finiteApertureReconstructor
     assert np.linalg.eigvalsh(a).min() > -1e-8
     model.ao.wfs.processing.noiseVar[0] = .01
     with pytest.raises(ValueError, match='noise'):
@@ -101,14 +101,14 @@ def test_real_covariance_cache_reuse_and_invalidation(tmp_path):
     model.ao.wfs.processing.noiseVar[0] = 0.
     model.ao.atm.wSpeed[0] *= 1.2
     c, _ = model.finite_aperture_covariance(sampling, 0)
-    assert backend is not model.finiteApertureBackend
+    assert backend is not model._finiteApertureReconstructor
     assert np.linalg.norm(c-a) > 1e-8
     # A newly configured grid must create a distinct estimator and signature.
-    old = model.finiteApertureBackend
+    old = model._finiteApertureReconstructor
     model.my_data_map['sensor_HO']['GridOffsets'][0][0] += .1
     model.finite_aperture_covariance(sampling, 0)
-    assert old is not model.finiteApertureBackend
-    assert np.linalg.norm(old.weights-model.finiteApertureBackend.weights) > 1e-8
+    assert old is not model._finiteApertureReconstructor
+    assert np.linalg.norm(old.weights-model._finiteApertureReconstructor.weights) > 1e-8
 
 
 def test_periodic_full_coverage_has_frequency_local_limit(tmp_path):
@@ -166,10 +166,10 @@ def test_builtin_extra_error_uses_same_stationary_pupil_fit_optics(tmp_path):
     period=1/float(model.freq.kxAO_[1,0]-model.freq.kxAO_[0,0])
     sample=FinitePupilSampling(model.ao.tel.pupil,n,side,period,optical_n=n)
     baseline, _ = model.finite_aperture_covariance(sample,0)
-    original=model.finiteApertureBackend.weights.copy()
+    original=model._finiteApertureReconstructor.weights.copy()
     model.ao.tel.extraErrorNm=129.46549607941247
     extended, _ = model.finite_aperture_covariance(sample,0)
-    backend=model.finiteApertureBackend
+    backend=model._finiteApertureReconstructor
     np.testing.assert_array_equal(original,backend.weights)
     # Subtraction of the large projected-feedback covariance loses a few ulps.
     rounding = 8*np.finfo(float).eps*max(np.abs(baseline).max(), 1.)
@@ -193,10 +193,10 @@ def test_static_phase_does_not_change_reconstruction_or_dynamic_covariance(tmp_p
     period = 1/float(model.freq.kxAO_[1,0]-model.freq.kxAO_[0,0])
     sampling = FinitePupilSampling(model.ao.tel.pupil,n,side,period)
     before,_ = model.finite_aperture_covariance(sampling,0)
-    backend = model.finiteApertureBackend
+    backend = model._finiteApertureReconstructor
     model.ao.tel.opdMap_on = np.sin(np.indices(model.ao.tel.pupil.shape)[0])*80
     after,_ = model.finite_aperture_covariance(sampling,0)
-    assert model.finiteApertureBackend is backend
+    assert model._finiteApertureReconstructor is backend
     np.testing.assert_array_equal(before,after)
 
 
@@ -212,9 +212,9 @@ def test_residual_blocks_match_dense_covariance_and_keep_cache_ownership(tmp_pat
     phase=.2*np.sin(np.indices(pupil.shape)[0])
     sample=FinitePupilSampling(pupil,n,side,period,static_phase=phase)
     residual,_=model.finite_aperture_residual(sample,0)
-    assert model.finiteApertureBackend._source_covariance is None
+    assert model._finiteApertureReconstructor._source_covariance is None
     snapshots=[(first,block.copy()) for first,block in residual.blocks(7)]
-    assert model.finiteApertureBackend._source_covariance is None
+    assert model._finiteApertureReconstructor._source_covariance is None
     dense,_=model.finite_aperture_covariance(sample,0)
     np.testing.assert_allclose(residual.diagonal,np.diag(dense),atol=2e-12,rtol=2e-12)
     for first,block in snapshots:

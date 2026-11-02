@@ -27,18 +27,30 @@ def residual_stream_moments(c11, c22, c1212, c12, c1_12, c2_12, feedback):
     return c11, (residual+residual.T)*.5, cross
 
 
-
 class CoupledFiniteResidual:
-    """Complete residual with a field-owned symmetric covariance update."""
-    def __init__(self, base, operator, update):
-        self.base, self.operator, self.update = base, operator, update
-        self.diagonal = base.diagonal+2*np.einsum('ij,ij->i',update,operator)
+    """Complete residual with a symmetric covariance update and bounded storage."""
+    def __init__(self, base, operator, update, device=None):
+        self.base, self.operator, self.update, self.device = base, operator, update, device
+        extra = 2*np.einsum('ij,ij->i', update, operator) if device is None else device.diagonal()
+        self.diagonal = base.diagonal+extra
 
     def blocks(self, rows=None):
-        for first, covariance in self.base.blocks(rows):
-            last = first+len(covariance)
-            covariance += self.update[first:last]@self.operator[first:].T
-            covariance += self.operator[first:last]@self.update[first:].T
-            index = np.arange(last-first)
-            covariance[index,index] = self.diagonal[first:last]
-            yield first,covariance
+        if self.device is None:
+            for first, covariance in self.base.blocks(rows):
+                last = first+len(covariance)
+                covariance += self.update[first:last]@self.operator[first:].T
+                covariance += self.operator[first:last]@self.update[first:].T
+                index = np.arange(last-first)
+                covariance[index,index] = self.diagonal[first:last]
+                yield first,covariance
+        else:
+            if rows is None: rows = max(1,min(512,(64*1024**2)//(8*len(self.diagonal))))
+            if not isinstance(rows,int) or rows <= 0:
+                raise ValueError('Covariance block rows must be positive')
+            for first in range(0,len(self.diagonal),rows):
+                last = min(first+rows,len(self.diagonal))
+                covariance = self.base.background_block(first,last)
+                covariance += self.device.block(first,last)
+                index = np.arange(last-first)
+                covariance[index,index] = self.diagonal[first:last]
+                yield first,covariance

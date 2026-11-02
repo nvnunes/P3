@@ -25,7 +25,7 @@ def input_signature(native):
     from .mirrorSurface import geometry_signature
     state = dict(surface_geometry=[geometry_signature(native.my_data_map['DM'],native.ao.resolve_path)] +
         ([geometry_signature(native.my_data_map['DM_science'],native.ao.resolve_path)] if native.twoStageEnabled else []),
-        configuration=native.my_data_map, controller=native.ao.rtc.holoop,
+        covariance_backend=native.finiteApertureBackend, configuration=native.my_data_map, controller=native.ao.rtc.holoop,
         numerical_floor=native.tomoRelRegFloor, exposure=native.exposureTime)
     h = hashlib.sha256(json.dumps(state, sort_keys=True,
         default=lambda x: np.asarray(x).tolist()).encode())
@@ -205,7 +205,7 @@ class FiniteResidualCovariance:
 def validate_native(native):
     """Reject combinations outside this candidate's tested physical contract."""
     if not isinstance(native.freq.kxAO_, np.ndarray):
-        raise ValueError('Finite-aperture reconstruction requires CPU P3 arrays; set P3_DISABLE_GPU=1 before importing P3.')
+        raise ValueError('Finite-aperture reconstruction requires CPU P3 arrays; set P3_DISABLE_GPU=1 before importing P3. Use finiteApertureBackend for optional GPU covariance products.')
     sensor = native.my_data_map.get('sensor_HO', {})
     native._validate_tomographic_aliasing()
     if native.temporalModel != 'polc' or native.exposureTime != 0:

@@ -53,7 +53,8 @@ floor of `1e-6`. The setting requires finite-aperture reconstruction.
 The prior, geometry, regularization, atmospheric source completion and all
 changed atmospheric/command cross terms are shared by single-stage LTAO and
 [science correction](two-stage-fourier.md). Existing finite-model restrictions
-on geometry, noise and optics still apply. Reconstruction and covariance products run on CPU in float64.
+on geometry, noise and optics still apply. Reconstruction runs on CPU in float64. Optional CUDA/Metal covariance products
+are selected through the `finiteApertureBackend` Python API, not an INI setting.
 
 The experimental `SurfaceModel`, `SurfaceGeometry`, `RemoveMeanSlopes`,
 `ReconstructionPrior`, `ReconstructionNoiseFraction` and `CovarianceArrayBackend`

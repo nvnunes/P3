@@ -6,7 +6,7 @@ from scipy import integrate,linalg
 from p3.aoSystem.mirrorSurface import geometry_signature
 from p3.aoSystem.finiteActuator import FiniteActuatorReconstructor
 from p3.aoSystem.finiteAperture import _stationary
-from test_finite_two_stage import coupled_model,sampling
+from test_finite_two_stage import coupled_model,sampling,require_device
 
 
 def model(path):
@@ -92,6 +92,21 @@ def test_gaussian_joint_moments_from_independent_shared_waves(tmp_path):
         np.testing.assert_allclose(actual,expected,rtol=1e-9,atol=1e-10)
 
 
+@pytest.mark.parametrize('device_name', ['cuda', 'mps'])
+def test_command_factored_device_preserves_complete_psf(tmp_path, device_name):
+    require_device(device_name)
+    value=model(tmp_path/'case');value.removeMeanSlopes=False;s=sampling(value);b=value._finite_aperture_backend()
+    cpu,_=b.residual_covariance(s,0);cpu_psf,_=s.psf(cpu)
+    if device_name == 'mps':
+        from p3.aoSystem.finiteTwoStageMps import MpsFiniteProducts
+        b.device=MpsFiniteProducts(b,s)
+    else:
+        from p3.aoSystem.finiteTwoStageCupy import CupyFiniteProducts
+        b.device=CupyFiniteProducts(b,s)
+    actual,_=b.residual_covariance(s,0);image,_=s.psf(actual)
+    tolerance = 2e-4 if device_name == 'mps' else 2e-10
+    np.testing.assert_allclose(actual,cpu,rtol=tolerance,atol=tolerance)
+    assert np.abs(image-cpu_psf).sum() < (1e-4 if device_name == 'mps' else 1e-10)
 
 
 def test_phase_target_covariance_matches_direct_wave_sum(tmp_path):

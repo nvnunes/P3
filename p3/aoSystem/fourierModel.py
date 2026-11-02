@@ -26,7 +26,7 @@ from p3.aoSystem.airRefraction import MatharAirRefraction
 from p3.aoSystem.processing import is_auto_noise_var
 from p3.aoSystem.reconstruction import reconstruction_model, MODEL_TEMPORAL_BEHAVIOUR
 from p3.aoSystem.twoStageFourier import TwoStageFourier
-from p3.aoSystem.scienceCorrection import configuration
+from p3.aoSystem.scienceCorrection import configuration, covariance_backend
 
 #%% DISPLAY FEATURES
 mpl.rcParams['font.size'] = 16
@@ -83,10 +83,16 @@ class fourierModel:
                  MV=0, nyquistSampling=False, addOtfPixel=False, freq=None, ao=None,
                  computeFocalAnisoCov=True, TiltFilter=False, doComputations=True,
                  psdExpansion=False, psdPerWavelength=False,
-                 reduce_memory=False, config_dict=None, computeOpticalPSD=False):
+                 reduce_memory=False, config_dict=None, computeOpticalPSD=False, finiteApertureBackend="numpy"):
         """
         Parameters
         ----------
+        finiteApertureBackend : str, optional
+            Numerical covariance products: "numpy" (default), "cuda" or "mps".
+            GPU products require active finite-aperture science correction.
+            CUDA uses CuPy float64 on the current device; Metal uses float32.
+            This is not an INI physics setting. Reconstruction solves remain
+            CPU double precision; set P3_DISABLE_GPU=1 before importing P3.
         path_ini : str
             Path to the .ini or .yml parameter file (ignored if ``ao`` or
             ``config_dict`` is given).
@@ -212,7 +218,7 @@ class fourierModel:
             self.my_data_map.get('sensor_HO', {}), self.my_data_map.get('RTC', {}))
         self.finiteApertureReconstruction = self.reconstructionModel == 'finite_aperture'
         self.twoStage = None
-        self._configure_science_correction()
+        self._configure_science_correction(finiteApertureBackend)
         self.removeMeanSlopes = (self.finiteApertureReconstruction
                                  and self.ao.lgs is not None
                                  and bool(nnp.all(self.ao.lgs.height > 0)))
@@ -220,7 +226,7 @@ class fourierModel:
             raise ValueError("ReconstructionModel='finite_aperture' requires covariance optics through TIPTOP; use calcPSF=False in P3")
         if self.finiteApertureReconstruction and self.reduce_memory:
             raise ValueError("ReconstructionModel='finite_aperture' currently requires reduce_memory=False")
-        self.finiteApertureBackend = None
+        self._finiteApertureReconstructor = None
         self.tomoRelRegFloor = self.my_data_map.get('sensor_HO', {}).get(
             'TomographicRegularizationFloor', self.tomoRelRegFloor)
         value = self.tomoRelRegFloor
@@ -660,8 +666,8 @@ class fourierModel:
         """
         return self._finite_aperture_backend().residual_covariance(sampling, field)
 
-    def _configure_science_correction(self):
-        """Validate and refresh parsed science settings before constructing the model.
+    def _configure_science_correction(self, backend):
+        """Validate and refresh parsed science settings before selecting a backend.
 
         The configuration dictionary owns science mirror/controller inputs.
         Reusing a finite model must refresh these values before its cache key
@@ -669,26 +675,28 @@ class fourierModel:
         """
         science, _ = configuration(self.my_data_map, self.reconstructionModel)
         enabled = science is not None and science.active
+        backend = covariance_backend(backend, self.reconstructionModel, science)
         if enabled and self.getErrorBreakDown:
             raise ValueError('Science correction has no validated single-stage error breakdown; inspect its component spectra instead')
         self.scienceMirror = science
         self.twoStageEnabled = enabled
+        self.finiteApertureBackend = backend
 
     def _finite_aperture_backend(self):
         if not self.finiteApertureReconstruction:
             raise ValueError("ReconstructionModel='finite_aperture' is disabled")
         from .finiteAperture import input_signature, validate_native
-        self._configure_science_correction()
+        self._configure_science_correction(self.finiteApertureBackend)
         validate_native(self)
         signature = input_signature(self)
-        if self.finiteApertureBackend is None or self.finiteApertureBackend.signature != signature:
+        if self._finiteApertureReconstructor is None or self._finiteApertureReconstructor.signature != signature:
             if self.twoStageEnabled:
                 from .finiteTwoStage import FiniteTwoStageReconstructor
-                self.finiteApertureBackend = FiniteTwoStageReconstructor(self)
+                self._finiteApertureReconstructor = FiniteTwoStageReconstructor(self)
             else:
                 from .finiteActuator import FiniteActuatorReconstructor
-                self.finiteApertureBackend = FiniteActuatorReconstructor(self)
-        return self.finiteApertureBackend
+                self._finiteApertureReconstructor = FiniteActuatorReconstructor(self)
+        return self._finiteApertureReconstructor
 
     def finite_aperture_residual(self, sampling, field):
         """Return the complete fitted-pupil residual as upper covariance blocks.

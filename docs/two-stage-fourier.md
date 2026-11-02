@@ -58,10 +58,26 @@ validated LO handoff.
 
 ## Numerical execution
 
-Reconstruction and covariance products run on CPU in float64. Set
-`P3_DISABLE_GPU=1` before importing P3/TIPTOP. Directional results own their
-arrays while shared atmospheric and reconstruction state is reused.
-Changes to the science mirror or RTC settings refresh the cached model.
+`fourierModel(..., finiteApertureBackend='numpy')` and
+`baseSimulation(..., finiteApertureBackend='numpy')` default to CPU float64 products.
+For active two-stage finite aperture, `'cuda'` selects optional CuPy float64
+products on the current CUDA device; `'mps'` selects optional PyTorch Metal
+float32 products. Both use the same periodic cubic queries and covariance
+factorization. Reconstruction and shared solves remain CPU float64.
+
+Set `P3_DISABLE_GPU=1` before importing P3/TIPTOP: its global GPU array mode is
+separate and incompatible with finite reconstruction. This does not disable the
+explicit finite-aperture device products. Keep the selected CUDA device current
+while using the model and its residuals. CuPy must be installed for the host's
+CUDA runtime; PyTorch is needed only for MPS.
+
+An unavailable requested device raises an error; there is no silent CPU fallback.
+No rank, source band, kernel resolution or covariance term is discarded. Changing
+the API value rebuilds the cached reconstructor. Device products are not supported
+for single-stage finite or alias-aware reconstruction. There is no INI backend
+option. Hardware parity tests in `test_finite_two_stage.py` and
+`test_gaussian_mirrors.py` compare queries, covariance and PSFs against CPU; they
+skip explicitly when their device is unavailable.
 
 ## Verification
 
@@ -69,3 +85,8 @@ Run `tests/test_two_stage_fourier.py`, `tests/test_finite_two_stage.py`,
 `tests/test_gaussian_mirrors.py`, `tests/test_finite_mean_slopes.py` and
 `tests/test_science_configuration.py` with the sibling TIPTOP/MASTSEL packages
 available and `P3_DISABLE_GPU=1`, `MASTSEL_DISABLE_GPU=1`.
+
+`tests/test_finite_device_products.py` additionally checks device-state lifetime,
+cache selection and explicit unavailable-device failures. Hardware parity tests
+in `test_finite_two_stage.py` and `test_gaussian_mirrors.py` require the selected
+CUDA or Metal device; unavailable hardware is reported as a skip.

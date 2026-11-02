@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
-from p3.aoSystem.scienceCorrection import configuration
+from p3.aoSystem.scienceCorrection import configuration, covariance_backend
 from test_finite_two_stage import coupled_model, sampling
 
 
@@ -43,6 +43,15 @@ def test_regularization_is_explicit_nonnegative_number(value):
     with pytest.raises(ValueError):configuration(c,'finite_aperture')
 
 
+@pytest.mark.parametrize('backend', ['cuda', 'mps'])
+def test_numerical_backend_is_api_scoped(backend):
+    stage,_=configuration(sections(),'finite_aperture')
+    assert covariance_backend(backend,'finite_aperture',stage)==backend
+    for value,model,science in [('typo','finite_aperture',stage),(backend,'finite_aperture',None),
+                                (backend,'alias_aware',stage)]:
+        with pytest.raises(ValueError):covariance_backend(value,model,science)
+    with pytest.raises(ValueError,match='finite_aperture'):
+        configuration({'sensor_HO':{'ReconstructionRegularization':.1}},'alias_aware')
 
 
 def test_zero_science_gain_does_not_read_inactive_geometry(tmp_path):
@@ -112,7 +121,7 @@ def test_generated_geometry_and_equivalent_fits_produce_same_psf(tmp_path, scien
         value.my_data_map[name].pop('PathInfGeometry')
     sample = sampling(value)
     covariance, _ = value.finite_aperture_covariance(sample, 0)
-    backend = value.finiteApertureBackend
+    backend = value._finiteApertureReconstructor
     image, _ = sample.psf(covariance)
     assert np.isfinite(image).all()
     np.testing.assert_allclose(image.sum(), 1., atol=2e-12)
@@ -132,7 +141,7 @@ def test_generated_geometry_and_equivalent_fits_produce_same_psf(tmp_path, scien
         fits.HDUList(hdus).writeto(path)
         value.my_data_map[name]['PathInfGeometry'] = str(path)
     explicit, _ = value.finite_aperture_covariance(sample, 0)
-    assert value.finiteApertureBackend is not backend
+    assert value._finiteApertureReconstructor is not backend
     np.testing.assert_array_equal(covariance, explicit)
 
 
@@ -172,7 +181,7 @@ def test_changed_science_settings_match_a_fresh_model(tmp_path, change):
         value.my_data_map['DM_science'].pop('PathInfGeometry')
     sample = sampling(value)
     before, _ = value.finite_aperture_covariance(sample, 0)
-    old = value.finiteApertureBackend
+    old = value._finiteApertureReconstructor
     rtc = value.my_data_map['RTC_science']
     if change == 'gain': rtc['LoopGain_HO'] = .4
     elif change == 'delay': rtc['LoopDelaySteps_HO'] = 2
@@ -190,13 +199,13 @@ def test_changed_science_settings_match_a_fresh_model(tmp_path, change):
                         display=False, verbose=False, reduce_memory=False,
                         computeOpticalPSD=True, computeFocalAnisoCov=False)
     expected, _ = fresh.finite_aperture_covariance(sample, 0)
-    assert value.finiteApertureBackend is not old
+    assert value._finiteApertureReconstructor is not old
     assert value.scienceMirror == fresh.scienceMirror
     assert value.twoStageEnabled == fresh.twoStageEnabled
     assert not np.array_equal(before, actual)
     np.testing.assert_array_equal(actual, expected)
     # Unchanged settings retain the newly built calculation.
-    assert value._finite_aperture_backend() is value.finiteApertureBackend
+    assert value._finite_aperture_backend() is value._finiteApertureReconstructor
 
 
 def test_changed_science_settings_are_revalidated_before_reuse(tmp_path):
@@ -205,4 +214,12 @@ def test_changed_science_settings_are_revalidated_before_reuse(tmp_path):
     value.my_data_map['RTC_science'].pop('LoopDelaySteps_HO')
     with pytest.raises(ValueError, match='explicit'):
         value._finite_aperture_backend()
-    assert value.finiteApertureBackend is old
+    assert value._finiteApertureReconstructor is old
+
+
+def test_disabling_science_revalidates_numerical_backend_scope(tmp_path):
+    value = coupled_model(tmp_path/'case')
+    value.finiteApertureBackend = 'mps'
+    value.my_data_map['RTC_science']['LoopGain_HO'] = 0.
+    with pytest.raises(ValueError, match='active finite-aperture'):
+        value._finite_aperture_backend()

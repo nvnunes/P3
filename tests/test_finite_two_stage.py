@@ -12,7 +12,7 @@ from test_finite_aperture import small_model
 from test_p3_bugfixes_noise_tomo import _p3_path
 
 
-def coupled_model(path, enabled=True):
+def coupled_model(path, enabled=True, covariance_backend="numpy"):
     first=small_model(path, True)
     config = ConfigParser(); config.optionxform = str
     config.read(path/'system.ini')
@@ -25,7 +25,7 @@ def coupled_model(path, enabled=True):
     with (path/'system.ini').open('w') as stream: config.write(stream)
     return fourierModel(str(path/'system.ini'), path_root=_p3_path(), calcPSF=False,
         display=False, verbose=False, reduce_memory=False, computeOpticalPSD=True,
-        computeFocalAnisoCov=False)
+        computeFocalAnisoCov=False, finiteApertureBackend=covariance_backend)
 
 
 def sampling(model):
@@ -102,13 +102,52 @@ def test_disabled_science_preserves_current_finite_ltao(tmp_path):
     actual,_ = model.finite_aperture_covariance(sample,0)
     expected,_ = reference.finite_aperture_covariance(sample,0)
     from p3.aoSystem.finiteActuator import FiniteActuatorReconstructor
-    assert type(model.finiteApertureBackend) is FiniteActuatorReconstructor
+    assert type(model._finiteApertureReconstructor) is FiniteActuatorReconstructor
     np.testing.assert_array_equal(actual,expected)
-    np.testing.assert_array_equal(model.finiteApertureBackend.weights,reference.finiteApertureBackend.weights)
+    np.testing.assert_array_equal(model._finiteApertureReconstructor.weights,reference._finiteApertureReconstructor.weights)
 
 
+def require_device(name):
+    if name == 'mps':
+        torch = pytest.importorskip('torch')
+        if not torch.backends.mps.is_available():
+            pytest.skip('Metal is unavailable')
+    else:
+        cupy = pytest.importorskip('cupy')
+        try:
+            available = cupy.is_available()
+        except cupy.cuda.runtime.CUDARuntimeError:
+            available = False
+        if not available:
+            pytest.skip('CUDA is unavailable')
 
 
+@pytest.mark.parametrize('device_name', ['cuda', 'mps'])
+def test_device_matches_cpu_queries_covariance_and_psf(tmp_path, device_name):
+    require_device(device_name)
+    model = coupled_model(tmp_path/'case'); sample = sampling(model)
+    backend = FiniteTwoStageReconstructor(model)
+    cpu,_ = backend.residual_covariance(sample,0)
+    cpu_psf,_ = sample.psf(cpu)
+    expected = backend._query_crosses(sample,0)
+    device_model = coupled_model(tmp_path/'device', covariance_backend=device_name)
+    device = device_model._finite_aperture_backend()
+    gpu,_ = device.residual_covariance(sample,0)
+    actual = device.device.to_host(device._query_crosses(sample,0))
+    if device_name == 'mps':
+        np.testing.assert_allclose(actual,expected,rtol=3e-4,atol=2e-5)
+        np.testing.assert_allclose(gpu,cpu,rtol=3e-5,atol=3e-5)
+    else:
+        np.testing.assert_allclose(actual,expected,rtol=2e-10,atol=2e-10)
+        np.testing.assert_allclose(gpu,cpu,rtol=2e-10,atol=2e-10)
+    gpu_psf,_ = sample.psf(gpu)
+    assert np.abs(gpu_psf-cpu_psf).sum() < (1e-4 if device_name == 'mps' else 1e-10)
+    first,_ = device.residual_blocks(sample,0)
+    snapshot = [(i,b.copy()) for i,b in first.blocks(19)]
+    device.residual_blocks(sample,0)
+    for (i,expected),(j,actual) in zip(snapshot,first.blocks(19)):
+        assert i == j
+        np.testing.assert_array_equal(actual,expected)
 
 
 def test_field_residual_owns_directional_arrays_and_reuses_shared_state(tmp_path):
