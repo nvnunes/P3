@@ -105,6 +105,11 @@ class _DeviceField:
     def diagonal(self):
         return self.owner.to_host(2*(self.update*self.operator).sum(axis=1))
 
+    def reporting_factors(self):
+        """Copy covariance factors to the host for optional scalar accounting."""
+        return tuple(self.owner.to_host(value) for value in
+                     (self.operator, self.update, self.owner.common_operator, self.common))
+
     def block(self,first,last):
         o1=self.owner.common_operator; o2=self.operator; d=self.update; x=self.common
         value = d[first:last]@o2[first:].T+o2[first:last]@d[first:].T

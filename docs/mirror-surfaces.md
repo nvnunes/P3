@@ -1,5 +1,8 @@
 # Finite mirror surfaces
 
+Optional [input-band error reporting](finite-error-budget.md) uses the same
+mirror surfaces and optical pupil for both single-stage and MOAO budgets.
+
 `[sensor_HO] ReconstructionModel='finite_aperture'` uses physical Gaussian
 actuator surfaces, a physical phase prior and full residual covariance. LGS
 measurements have each sensor's mean x/y slopes removed, with complete POLC

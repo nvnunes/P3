@@ -117,6 +117,8 @@ class fourierModel:
             so that the PSD is also computed at the NGS positions.
         getErrorBreakDown : bool, optional
             Compute the error breakdown (fitting, aliasing, noise, ...).
+            Finite-aperture reporting is deferred until optical pupil fields
+            are evaluated and exposed separately as ``finiteErrorBreakDown``.
         getFWHM, getEnsquaredEnergy, getEncircledEnergy : bool, optional
             Compute the corresponding PSF metric (requires ``calcPSF``).
         fftphasor : bool, optional
@@ -174,6 +176,7 @@ class fourierModel:
         self.display = display
         self.displayContour = displayContour
         self.getErrorBreakDown = getErrorBreakDown
+        self.finiteErrorBreakDown = {}
         self.get_metrics = getFWHM or getEnsquaredEnergy or getEncircledEnergy
         self.calcPSF = calcPSF
         self.tag = 'TIPTOP'
@@ -305,6 +308,7 @@ class fourierModel:
     def initComputations(self):
 
         tstart = time.time()
+        self.finiteErrorBreakDown = {}
 
         if self.ao.error is False:
 
@@ -676,7 +680,7 @@ class fourierModel:
         science, _ = configuration(self.my_data_map, self.reconstructionModel)
         enabled = science is not None and science.active
         backend = covariance_backend(backend, self.reconstructionModel, science)
-        if enabled and self.getErrorBreakDown:
+        if enabled and self.getErrorBreakDown and not self.finiteApertureReconstruction:
             raise ValueError('Science correction has no validated single-stage error breakdown; inspect its component spectra instead')
         self.scienceMirror = science
         self.twoStageEnabled = enabled
@@ -690,6 +694,7 @@ class fourierModel:
         validate_native(self)
         signature = input_signature(self)
         if self._finiteApertureReconstructor is None or self._finiteApertureReconstructor.signature != signature:
+            self.finiteErrorBreakDown = {}
             if self.twoStageEnabled:
                 from .finiteTwoStage import FiniteTwoStageReconstructor
                 self._finiteApertureReconstructor = FiniteTwoStageReconstructor(self)
@@ -705,8 +710,30 @@ class fourierModel:
         ``finite_aperture_covariance``. The returned object owns this field's
         measurement queries and exposes ``diagonal`` and ``blocks(rows)``;
         no dense field covariance is materialized. Units are radians squared.
+        With ``getErrorBreakDown=True``, also populate ``finiteErrorBreakDown``
+        with TIPTOP-style input-band components in nm squared and the applied
+        static-phase variance. Dynamic accounting remains independently cached.
         """
-        return self._finite_aperture_backend().residual_blocks(sampling,field)
+        backend = self._finite_aperture_backend()
+        residual, profile = backend.residual_blocks(sampling, field)
+        if self.getErrorBreakDown:
+            from .finiteErrorBudget import FiniteErrorBudget
+            started = time.perf_counter()
+            budget = getattr(backend, '_error_budget', None)
+            if budget is None or budget.key != backend._sampling:
+                budget = backend._error_budget = FiniteErrorBudget(backend, sampling)
+                self.finiteErrorBreakDown = {}
+            record = budget.evaluate(field, residual)
+            phase = getattr(sampling, 'static_phase', None)
+            if phase is not None:
+                weight = sampling.intensity
+                variance = nnp.sum(weight*(phase-weight@phase)**2)
+                record = record.with_optics(ncpa_nm2=float(variance*(self.freq.wvlRef*1e9/(2*nnp.pi))**2))
+            self.finiteErrorBreakDown[field] = record
+            seconds = time.perf_counter()-started
+            self.t_errorBreakDown += 1000*seconds
+            profile = dict(profile, error_budget_seconds=seconds)
+        return residual, profile
 
     def _sensed_layers_mask(self, heights) -> nnp.ndarray:
         """Boolean mask of the layers seen by the HO guide star (all of them for NGS)."""
@@ -2621,8 +2648,18 @@ class fourierModel:
 
 #%% AO ERROR BREAKDOWN
     def errorBreakDown(self,verbose=True):
-        """ AO error breakdown from the PSD integrals
+        """Report PSD integrals, or return evaluated finite input-band budgets.
+
+        Finite budgets use a different, explicitly named aliasing convention;
+        they do not populate legacy ``wfeAl`` or other PSD-integral attributes.
         """
+        if self.finiteApertureReconstruction:
+            if not self.finiteErrorBreakDown:
+                raise ValueError('Finite error breakdown requires getErrorBreakDown=True and evaluated optical pupil fields')
+            if verbose:
+                field = min(self.finiteErrorBreakDown, key=lambda i: self.ao.src.zenith[i])
+                self.finiteErrorBreakDown[field].print(float(self.freq.wvlRef))
+            return dict(self.finiteErrorBreakDown)
         tstart  = time.time()
 
         if self.ao.rtc.holoop['gain'] != 0:
