@@ -25,6 +25,8 @@ from p3.aoSystem.frequencyDomain import frequencyDomain
 from p3.aoSystem.airRefraction import MatharAirRefraction
 from p3.aoSystem.processing import is_auto_noise_var
 from p3.aoSystem.reconstruction import reconstruction_model, MODEL_TEMPORAL_BEHAVIOUR
+from p3.aoSystem.twoStageFourier import TwoStageFourier
+from p3.aoSystem.scienceCorrection import configuration
 
 #%% DISPLAY FEATURES
 mpl.rcParams['font.size'] = 16
@@ -209,8 +211,8 @@ class fourierModel:
         self.reconstructionModel = reconstruction_model(
             self.my_data_map.get('sensor_HO', {}), self.my_data_map.get('RTC', {}))
         self.finiteApertureReconstruction = self.reconstructionModel == 'finite_aperture'
-        from .finiteConfiguration import configuration
-        configuration(self.my_data_map, self.reconstructionModel)
+        self.twoStage = None
+        self._configure_science_correction()
         self.removeMeanSlopes = (self.finiteApertureReconstruction
                                  and self.ao.lgs is not None
                                  and bool(nnp.all(self.ao.lgs.height > 0)))
@@ -571,6 +573,11 @@ class fourierModel:
                 # DEFINE THE RECONSTRUCTOR
                 self.spatialReconstructor(MV=self.MV)
 
+                if self.twoStageEnabled:
+                    self.twoStage = TwoStageFourier(self, self.scienceMirror)
+                    if self.reduce_memory:
+                        self.Wtomo = None
+
                 # DEFINE THE CONTROLLER
                 self.controller(display=self.display)
 
@@ -653,15 +660,34 @@ class fourierModel:
         """
         return self._finite_aperture_backend().residual_covariance(sampling, field)
 
+    def _configure_science_correction(self):
+        """Validate and refresh parsed science settings before constructing the model.
+
+        The configuration dictionary owns science mirror/controller inputs.
+        Reusing a finite model must refresh these values before its cache key
+        is formed, including transitions to or from single-stage operation.
+        """
+        science, _ = configuration(self.my_data_map, self.reconstructionModel)
+        enabled = science is not None and science.active
+        if enabled and self.getErrorBreakDown:
+            raise ValueError('Science correction has no validated single-stage error breakdown; inspect its component spectra instead')
+        self.scienceMirror = science
+        self.twoStageEnabled = enabled
+
     def _finite_aperture_backend(self):
         if not self.finiteApertureReconstruction:
             raise ValueError("ReconstructionModel='finite_aperture' is disabled")
         from .finiteAperture import input_signature, validate_native
-        from .finiteActuator import FiniteActuatorReconstructor
+        self._configure_science_correction()
         validate_native(self)
         signature = input_signature(self)
         if self.finiteApertureBackend is None or self.finiteApertureBackend.signature != signature:
-            self.finiteApertureBackend = FiniteActuatorReconstructor(self)
+            if self.twoStageEnabled:
+                from .finiteTwoStage import FiniteTwoStageReconstructor
+                self.finiteApertureBackend = FiniteTwoStageReconstructor(self)
+            else:
+                from .finiteActuator import FiniteActuatorReconstructor
+                self.finiteApertureBackend = FiniteActuatorReconstructor(self)
         return self.finiteApertureBackend
 
     def finite_aperture_residual(self, sampling, field):
@@ -852,7 +878,8 @@ class fourierModel:
             self.W = np.matmul(self.Popt, self.Wtomo)
             if self.reduce_memory:
                 self.Popt = None
-                self.Wtomo = None
+                if not self.twoStageEnabled:
+                    self.Wtomo = None
 
             # Computation of the Pbeta^DM matrix
             k = np.sqrt(self.freq.k2AO_)
@@ -1342,7 +1369,8 @@ class fourierModel:
             # Aliasing
             if self.computeOpticalPSD and self.tomographicAliasing:
                 started = time.time()
-                alias, optical_alias = self._tomographic_aliasing_psd(optical_pair=True)
+                alias, optical_alias = (self.twoStage.alias_psd(optical_pair=True)
+                    if self.twoStageEnabled else self._tomographic_aliasing_psd(optical_pair=True))
                 self.psdAlias = np.real(alias)
                 optical_alias = np.real(optical_alias)
                 self.t_aliasingPSD = 1000*(time.time() - started)
@@ -1350,9 +1378,14 @@ class fourierModel:
                 self.psdAlias = np.real(self.aliasingPSD())
                 if self.computeOpticalPSD:
                     optical_alias = np.real(self.aliasingPSD(piston_filter=False))
-            psd[id1:id2,id1:id2,:] += self.psdAlias[:, :, np.newaxis]
-            if self.computeOpticalPSD:
-                optical_delta += (optical_alias-self.psdAlias)[:, :, None]
+            if self.psdAlias.ndim == 2:
+                psd[id1:id2,id1:id2,:] += self.psdAlias[:, :, np.newaxis]
+                if self.computeOpticalPSD:
+                    optical_delta += (optical_alias-self.psdAlias)[:, :, None]
+            else:
+                psd[id1:id2,id1:id2,:] += self.psdAlias
+                if self.computeOpticalPSD:
+                    optical_delta += optical_alias-self.psdAlias
 
             # --- free memory
             if self.reduce_memory and not self.getErrorBreakDown:
@@ -1781,6 +1814,8 @@ class fourierModel:
         With optical_pair, return (variance, optical) spectra from the same
         commands, retaining each input-power factor and summation order.
         """
+        if self.twoStageEnabled:
+            return self.twoStage.alias_psd(piston_filter, optical_pair)
         self._validate_tomographic_aliasing()
         if optical_pair and not piston_filter:
             raise ValueError('Paired spectra require piston_filter=True')
@@ -2033,6 +2068,8 @@ class fourierModel:
         For tomography, optical_pair returns (variance, optical) spectra using
         the same residual responses with their distinct input-power weights.
         """
+        if self.twoStageEnabled:
+            return self.twoStage.main_psd(piston_filter, optical_pair)
         if optical_pair and (not piston_filter or self.nGs < 2):
             raise ValueError('Paired spectra require tomography and piston_filter=True')
         tstart = time.time()

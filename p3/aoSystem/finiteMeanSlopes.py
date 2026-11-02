@@ -34,23 +34,30 @@ def row_response(backend, rows, layer):
 class ProjectedFeedback:
     """Shared moments of the exact change caused by per-WFS slope projection.
 
-    The two removed slope modes per WFS alter the common command stream. Frequency-dependent POLC feedback is solved without truncation;
+    The eight (two per WFS) removed slope modes produce three small command
+    streams. Frequency-dependent POLC feedback is solved without truncation;
     field-specific contractions preserve every atmospheric/command cross term.
     Instances belong to one finite backend and its immutable configuration.
     """
     def __init__(self,backend):
         started=time.perf_counter(); b=backend
         self.b=b
+        stage=b.native.scienceMirror if b.native.twoStageEnabled else None
+        self.science_gain=stage.gain if stage is not None else 0.
+        self.science_delay=stage.delay if stage is not None else 0
         self.means=np.kron(np.eye(b.nc),np.ones((b.nv,1))/np.sqrt(b.nv))
         self.feedback_means=b.feedback@self.means
         small=self.means.T@self.feedback_means
         rows=np.concatenate((self.means.T,self.means.T@b.feedback))
-        self.covariance=np.zeros((b.nc,b.nc))
-        self.cross=np.zeros((b.nc*b.nv,b.nc))
+        self.covariance=np.zeros((3*b.nc,3*b.nc))
+        self.cross=np.zeros((3,b.nc*b.nv,3*b.nc))
         self.layers=[]
         for layer,(a,h) in enumerate(zip(b.contraction,b.heights)):
             response=row_response(b,rows,layer)
             h1=b.temporal[layer]
+            direction=np.deg2rad(b.native.ao.atm.wDir[layer])
+            frequency=(b.qx*np.cos(direction)+b.qy*np.sin(direction))*b.native.ao.atm.wSpeed[layer]
+            h2=self.science_gain*np.exp(2j*np.pi*frequency*self.science_delay/b.native.ao.rtc.holoop['rate'])
             rhs=-response[:b.nc]+h1*response[b.nc:]
             t=np.empty_like(rhs)
             flat=rhs.reshape(b.nc,-1);target=t.reshape(b.nc,-1);control=h1.ravel()
@@ -58,27 +65,31 @@ class ProjectedFeedback:
                 sl=slice(first,min(first+4096,len(control)))
                 matrix=np.eye(b.nc)[None]-control[sl,None,None]*small
                 target[:,sl]=(np.linalg.solve(matrix,flat[:,sl].T[...,None])[...,0]*control[sl,None]).T
-            z=t
+            z=np.concatenate((t,h2*rhs,h2*t))
             power=b.raw[layer]*b.dk**2
             self.layers.append(z)
-            zr=z.reshape(b.nc,-1);pr=power.ravel()
+            zr=z.reshape(3*b.nc,-1);pr=power.ravel()
             self.covariance+=((zr*pr)@zr.conj().T).real
             for guide in range(b.ng):
                 shift=a*b.offsets[guide]+h*b.guide[guide]
                 for axis in range(2):
                     channel=2*guide+axis
                     base=power*b.gradients[layer,axis]*z.conj()
-                    values=_fourier_sum_many(base*h1,b.dk,
-                        shift-a*b.pitch*(b.ncell-1)/2,a*b.pitch,b.ncell).real
-                    index=np.rint(b.cells/b.pitch+(b.ncell-1)/2).astype(int)
-                    self.cross[channel*b.nv:(channel+1)*b.nv]+=values[:,index[:,0],index[:,1]].T
+                    for stream,multiplier in enumerate((h1,h2,h1*h2)):
+                        values=_fourier_sum_many(base*multiplier,b.dk,
+                            shift-a*b.pitch*(b.ncell-1)/2,a*b.pitch,b.ncell).real
+                        index=np.rint(b.cells/b.pitch+(b.ncell-1)/2).astype(int)
+                        self.cross[stream,channel*b.nv:(channel+1)*b.nv]+=values[:,index[:,0],index[:,1]].T
         self.seconds=time.perf_counter()-started
 
     def wrap(self,residual,sampling,field):
         """Return a field-owned symmetric update of the original covariance."""
         b=self.b
-        operator=b.operator@self.means
-        old_cross=b.operator@self.cross
+        science=(b.science_operator(sampling,field) if self.science_gain else np.zeros_like(b.operator))
+        projected_feedback=self.feedback_means-self.means@(self.means.T@self.feedback_means)
+        operator=np.concatenate((b.operator@self.means,science@self.means,
+                                 -science@projected_feedback),axis=1)
+        old_cross=b.operator@self.cross[0]+science@(self.cross[1]-b.feedback@self.cross[2])
         atmospheric=np.zeros_like(operator)
         beta=b.native.ao.src.direction[:,field]
         ys=(sampling.ys-sampling.n//2)%sampling.n

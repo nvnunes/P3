@@ -23,7 +23,8 @@ from .finiteConfiguration import configuration
 def input_signature(native):
     """Identify all configuration and realized physical operator inputs."""
     from .mirrorSurface import geometry_signature
-    state = dict(surface_geometry=geometry_signature(native.my_data_map['DM'],native.ao.resolve_path),
+    state = dict(surface_geometry=[geometry_signature(native.my_data_map['DM'],native.ao.resolve_path)] +
+        ([geometry_signature(native.my_data_map['DM_science'],native.ao.resolve_path)] if native.twoStageEnabled else []),
         configuration=native.my_data_map, controller=native.ao.rtc.holoop,
         numerical_floor=native.tomoRelRegFloor, exposure=native.exposureTime)
     h = hashlib.sha256(json.dumps(state, sort_keys=True,

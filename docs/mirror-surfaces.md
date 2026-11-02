@@ -6,14 +6,15 @@ measurements have each sensor's mean x/y slopes removed, with complete POLC
 feedback. This projection is not applied to genuine NGS HO measurements.
 These are properties of the model, not independent switches.
 
-The common mirror (`DM`) uses existing
+Each active mirror (`DM`, and optionally `DM_science`) uses existing
 `InfModel='gaussian'` and `InfCoupling=[...]`, with optional `PathInfGeometry`.
 The optional path resolves through the normal P3 external-file resolver.
 Another influence model is rejected. Without the path (or with an empty string),
 a centred regular grid uses the resolved `NumberActuators` and `DmPitchs`.
 Actuator centres are retained where the nearest telescope-pupil sample is
 illuminated. Calibration coordinates span `[-D/2, D/2]` at the pupil's own
-resolution; no padding is added. A supplied FITS file replaces this layout, allowing a padded grid
+resolution; no padding is added. Each mirror chooses its default or override
+independently. A supplied FITS file replaces this layout, allowing a padded grid
 and an explicit valid-actuator mask. Invalid supplied files raise errors.
 
 ## Geometry FITS contract
@@ -50,18 +51,11 @@ inject measurement noise. The accepted comparison uses `0.1` and a numerical
 floor of `1e-6`. The setting requires finite-aperture reconstruction.
 
 The prior, geometry, regularization, atmospheric source completion and all
-changed atmospheric/command cross terms belong to this single-stage model.
-Existing finite-model restrictions on geometry, noise and optics still apply.
-Set `P3_DISABLE_GPU=1` before importing P3 for CPU reconstruction.
+changed atmospheric/command cross terms are shared by single-stage LTAO and
+[science correction](two-stage-fourier.md). Existing finite-model restrictions
+on geometry, noise and optics still apply. Reconstruction and covariance products run on CPU in float64.
 
 The experimental `SurfaceModel`, `SurfaceGeometry`, `RemoveMeanSlopes`,
 `ReconstructionPrior`, `ReconstructionNoiseFraction` and `CovarianceArrayBackend`
 keys are rejected, including when false or inactive. Replaying earlier experiments
 requires their retained sources and inputs.
-
-## Verification
-
-Run `tests/test_finite_aperture.py` and `tests/test_finite_single_stage.py`
-with the sibling TIPTOP/MASTSEL packages available, `P3_DISABLE_GPU=1` and
-`MASTSEL_DISABLE_GPU=1`. These check physical-wave identities, geometry,
-regularization, covariance cache invalidation and normalized PSFs.

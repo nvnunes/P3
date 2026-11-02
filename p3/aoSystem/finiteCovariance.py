@@ -19,6 +19,15 @@ def _fourier_sum_many(spectra, dk, start, step, size):
     return z*np.exp(-2j*np.pi*(count//2)*dk*x)[None, :, None]*np.exp(-2j*np.pi*(count//2)*dk*y)[None, None, :]
 
 
+def residual_stream_moments(c11, c22, c1212, c12, c1_12, c2_12, feedback):
+    """Joint moments of a=h1*y and b=h2*y-L*h1*h2*y, all real coordinates."""
+    cross = c12-c1_12@feedback.T
+    residual = c22-c2_12@feedback.T-feedback@c2_12.T
+    residual += (feedback@c1212)@feedback.T
+    return c11, (residual+residual.T)*.5, cross
+
+
+
 class CoupledFiniteResidual:
     """Complete residual with a field-owned symmetric covariance update."""
     def __init__(self, base, operator, update):
