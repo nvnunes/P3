@@ -209,6 +209,11 @@ class fourierModel:
         self.reconstructionModel = reconstruction_model(
             self.my_data_map.get('sensor_HO', {}), self.my_data_map.get('RTC', {}))
         self.finiteApertureReconstruction = self.reconstructionModel == 'finite_aperture'
+        from .finiteConfiguration import configuration
+        configuration(self.my_data_map, self.reconstructionModel)
+        self.removeMeanSlopes = (self.finiteApertureReconstruction
+                                 and self.ao.lgs is not None
+                                 and bool(nnp.all(self.ao.lgs.height > 0)))
         if self.finiteApertureReconstruction and calcPSF:
             raise ValueError("ReconstructionModel='finite_aperture' requires covariance optics through TIPTOP; use calcPSF=False in P3")
         if self.finiteApertureReconstruction and self.reduce_memory:
@@ -651,11 +656,12 @@ class fourierModel:
     def _finite_aperture_backend(self):
         if not self.finiteApertureReconstruction:
             raise ValueError("ReconstructionModel='finite_aperture' is disabled")
-        from .finiteAperture import FiniteApertureReconstructor, input_signature, validate_native
+        from .finiteAperture import input_signature, validate_native
+        from .finiteActuator import FiniteActuatorReconstructor
         validate_native(self)
         signature = input_signature(self)
         if self.finiteApertureBackend is None or self.finiteApertureBackend.signature != signature:
-            self.finiteApertureBackend = FiniteApertureReconstructor(self)
+            self.finiteApertureBackend = FiniteActuatorReconstructor(self)
         return self.finiteApertureBackend
 
     def finite_aperture_residual(self, sampling, field):

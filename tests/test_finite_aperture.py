@@ -24,6 +24,12 @@ def small_model(path, option=None):
     if option is not None:
         config['sensor_HO']['ReconstructionModel'] = repr('finite_aperture' if option else 'standard')
     path.mkdir()
+    if option:
+        from _finite_geometry import write_geometry
+        geometry=path/'common.fits'
+        write_geometry(geometry, int(config['telescope'].get('Resolution',256)))
+        config['DM'].update(InfModel="'gaussian'",InfCoupling='[0.25]',
+                            PathInfGeometry=repr(str(geometry)))
     with (path/'system.ini').open('w') as f: config.write(f)
     return fourierModel(str(path/'system.ini'), path_root=_p3_path(), calcPSF=False,
         display=False, verbose=False, reduce_memory=False, computeOpticalPSD=True,
@@ -165,7 +171,10 @@ def test_builtin_extra_error_uses_same_stationary_pupil_fit_optics(tmp_path):
     extended, _ = model.finite_aperture_covariance(sample,0)
     backend=model.finiteApertureBackend
     np.testing.assert_array_equal(original,backend.weights)
-    np.testing.assert_allclose(extended-baseline, backend.additional_covariance, atol=2e-13, rtol=1e-11)
+    # Subtraction of the large projected-feedback covariance loses a few ulps.
+    rounding = 8*np.finfo(float).eps*max(np.abs(baseline).max(), 1.)
+    np.testing.assert_allclose(extended-baseline, backend.additional_covariance,
+                               atol=rounding, rtol=1e-11)
     actual,_=sample.psf(backend.additional_covariance)
     norm=(2*model.freq.kcMax_/model.freq.resAO*model.freq.wvlRef*1e9/(2*np.pi))**2
     nm2=model.extraErrorPSD()*norm

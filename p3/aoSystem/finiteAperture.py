@@ -17,11 +17,14 @@ from scipy.sparse import csr_matrix
 
 from .FourierUtils import pistonFilter
 from .atmosphericTail import AtmosphericTail
+from .finiteConfiguration import configuration
 
 
 def input_signature(native):
     """Identify all configuration and realized physical operator inputs."""
-    state = dict(configuration=native.my_data_map, controller=native.ao.rtc.holoop,
+    from .mirrorSurface import geometry_signature
+    state = dict(surface_geometry=geometry_signature(native.my_data_map['DM'],native.ao.resolve_path),
+        configuration=native.my_data_map, controller=native.ao.rtc.holoop,
         numerical_floor=native.tomoRelRegFloor, exposure=native.exposureTime)
     h = hashlib.sha256(json.dumps(state, sort_keys=True,
         default=lambda x: np.asarray(x).tolist()).encode())
@@ -30,6 +33,7 @@ def input_signature(native):
                    native.freq.kxAO_, native.freq.kyAO_, native.gs.height,
                    native.gs.direction, native.ao.src.direction, native.ao.src.wvl,
                    native.ao.atm.r0, native.ao.atm.L0, native.ao.tel.D,
+                   native.ao.dms.nActu1D, native.ao.dms.pitch,
                    [native.ao.tel.extraErrorNm, native.ao.tel.extraErrorExp,
                     native.ao.tel.extraErrorMin, native.ao.tel.extraErrorMax],
                    native.strechFactor, native.ao.dms.opt_dir, native.ao.dms.opt_weights,
@@ -159,6 +163,19 @@ class FiniteResidualCovariance:
         diagonal -= sc; diagonal -= sc
         self.diagonal = diagonal
 
+    def background_block(self, first, last):
+        """Stationary/source and common-correction block before phase cross terms."""
+        ramps = self.sampling.ramps
+        r, c = slice(first,last), slice(first,None)
+        independent = self.sampling.covariance_from_lags(self.lags,r,c)
+        independent -= ramps[:,r].T@self.points[:,c]
+        independent -= self.points[:,r].T@ramps[:,c]
+        independent += (ramps[:,r].T@self.tilt)@ramps[:,c]
+        covariance = independent
+        if self.additional is not None: covariance += self.additional[r,c]
+        covariance += self.correction[r,c]
+        return covariance
+
     def blocks(self, rows=None):
         """Yield ``(first, covariance[first:last, first:])`` without full intermediates.
 
@@ -174,13 +191,7 @@ class FiniteResidualCovariance:
         ramps = self.sampling.ramps
         for first in range(0,len(self.diagonal),rows):
             last = min(first+rows,len(self.diagonal)); r = slice(first,last); c = slice(first,None)
-            independent = self.sampling.covariance_from_lags(self.lags,r,c)
-            independent -= ramps[:,r].T@self.points[:,c]
-            independent -= self.points[:,r].T@ramps[:,c]
-            independent += (ramps[:,r].T@self.tilt)@ramps[:,c]
-            covariance = independent
-            if self.additional is not None: covariance += self.additional[r,c]
-            covariance += self.correction[r,c]
+            covariance = self.background_block(first,last)
             covariance -= self.cross[r]@self.operator[c].T
             covariance -= self.operator[r]@self.cross[c].T
             # Dot-product ordering differs between diagonal and blocked GEMM.
@@ -192,6 +203,8 @@ class FiniteResidualCovariance:
 
 def validate_native(native):
     """Reject combinations outside this candidate's tested physical contract."""
+    if not isinstance(native.freq.kxAO_, np.ndarray):
+        raise ValueError('Finite-aperture reconstruction requires CPU P3 arrays; set P3_DISABLE_GPU=1 before importing P3.')
     sensor = native.my_data_map.get('sensor_HO', {})
     native._validate_tomographic_aliasing()
     if native.temporalModel != 'polc' or native.exposureTime != 0:
@@ -209,8 +222,6 @@ def validate_native(native):
         raise ValueError('ReconstructionModel=finite_aperture currently requires all physical reconstruction layers')
     if native.ao.windPsdFile != 0:
         raise ValueError('ReconstructionModel=finite_aperture has not been validated with vibration')
-    if not isinstance(native.freq.kxAO_, np.ndarray):
-        raise ValueError('ReconstructionModel=finite_aperture is currently CPU-only')
 
 
 class FiniteApertureReconstructor:
@@ -227,6 +238,7 @@ class FiniteApertureReconstructor:
     def __init__(self, native):
         started = time.perf_counter(); validate_native(native)
         self.native = native
+        self.regularization = configuration(native.my_data_map, native.reconstructionModel)
         self.signature = input_signature(native)
         self.timings = {}
         self.pitch = float(native.ao.wfs.optics[0].dsub)
@@ -246,7 +258,7 @@ class FiniteApertureReconstructor:
         spectrum = native.ao.atm.spectrum(np.hypot(self.qx, self.qy))
         spectrum[0] = 0; spectrum[:, 0] = 0; spectrum[self.count//2, self.count//2] = 0
         self.raw = np.asarray(native.ao.atm.weights)[:, None, None]*spectrum
-        self.prior = self.raw*pistonFilter(float(native.ao.tel.D), np.hypot(self.qx, self.qy), dtype=native.dtype)
+        self.prior = self.raw.copy()
         self.heights = np.asarray(native.ao.atm.heights)
         self.contraction = 1/np.asarray(native.strechFactor)
         self.guide = np.asarray(native.gs.direction.T)
@@ -334,6 +346,9 @@ class FiniteApertureReconstructor:
         def matrix(values):
             return values.reshape(self.nc, self.nc, -1)[:, :, self.didx].transpose(0, 2, 1, 3).reshape(self.nc*self.nv, self.nc*self.nv)
         self.cov_prior, self.cov_regular, self.cov_raw = map(matrix, (prior, regular, raw))
+        if self.regularization:
+            self.cov_regular.flat[::len(self.cov_regular)+1] += (
+                self.regularization*np.diag(self.cov_prior).mean())
         self.factor = cho_factor(self.cov_regular, lower=True, check_finite=False)
         self.timings['measurement_covariance_seconds'] = time.perf_counter()-started
 
@@ -369,16 +384,8 @@ class FiniteApertureReconstructor:
             self._source_covariance = _stationary_matrix(*self.source_terms,self._source_sampling)
         return self._source_covariance
 
-    def prepare_optics(self, sampling, dense_source=True):
-        """Prepare/cache correction and science covariance for one optical grid."""
-        key = (sampling.n, sampling.native_n, sampling.native_side, sampling.period, sampling.signature)
-        if self._sampling == key:
-            if dense_source: _ = self.source
-            return
-        started = time.perf_counter()
-        if sampling.native_n != self.native_n or not np.isclose(sampling.period, self.period):
-            raise ValueError('Finite-aperture optics and reconstruction must share the physical Fourier period')
-        self.kernels = sampling.tilt_moments(self.count, self.period)
+    def _prepare_common_operator(self,sampling):
+        """Synthesize the current common Fourier command on the optical pupil."""
         index = self.qi+self.count//2
         moments = self.kernels[:, index[:, 0], index[:, 1]]
         self.operator = np.empty((len(sampling.xs), self.weights.shape[1]))
@@ -391,6 +398,18 @@ class FiniteApertureReconstructor:
             values = (fft.ifft2(power, axes=(0, 1))*sampling.n**2)[ys, xs]
             if abs(values.imag).max() > 2e-7: raise ValueError('Non-real finite-aperture command surface')
             self.operator[:, sl] = values.real-sampling.ramps.T@(moments@w).real
+
+    def prepare_optics(self, sampling, dense_source=True):
+        """Prepare/cache correction and science covariance for one optical grid."""
+        key = (sampling.n, sampling.native_n, sampling.native_side, sampling.period, sampling.signature)
+        if self._sampling == key:
+            if dense_source: _ = self.source
+            return
+        started = time.perf_counter()
+        if sampling.native_n != self.native_n or not np.isclose(sampling.period, self.period):
+            raise ValueError('Finite-aperture optics and reconstruction must share the physical Fourier period')
+        self.kernels = sampling.tilt_moments(self.count, self.period)
+        self._prepare_common_operator(sampling)
         self.correction = (self.operator@self.cov_raw)@self.operator.T
         self.source_terms = _stationary_terms(self.raw.sum(0)*self.dk**2, self.kernels, sampling, sampling.n)
         tail_started = time.perf_counter()
