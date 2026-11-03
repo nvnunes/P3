@@ -110,6 +110,13 @@ class FiniteActuatorReconstructor(FiniteApertureReconstructor):
         moments=np.array([(g.T@fit.T@g)[surface.ix,surface.iy] for fit in sampling.fit])
         return basis-sampling.ramps.T@moments
 
+    def _common_correction_covariance(self):
+        if self.native.finiteApertureBackend in ('cuda', 'mps'):
+            from .finiteCovariance import CommandCovariance
+            commands=(self.weights@self.cov_raw)@self.weights.T
+            return CommandCovariance(self.common_basis,commands)
+        return super()._common_correction_covariance()
+
     def _common_feedback(self):
         """Raw finite-lenslet response of the common actuator command."""
         started = time.perf_counter()

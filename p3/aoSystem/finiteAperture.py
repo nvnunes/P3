@@ -525,6 +525,9 @@ class FiniteApertureReconstructor:
         self._science_query = _ScienceMeasurementQuery(
             sampling.xy, self.cells, self.kernel_grid, self.period)
         self.timings['science_query_preparation_seconds'] = time.perf_counter()-query_started
+        if self.native.finiteApertureBackend == "cuda" and not self.native.twoStageEnabled:
+            from .finiteTwoStageCupy import CupyFiniteProducts
+            self.device = CupyFiniteProducts(self, sampling)
         self._sampling = key
         self.timings['optical_cache_preparation_seconds'] = time.perf_counter()-started
 
@@ -546,6 +549,9 @@ class FiniteApertureReconstructor:
             residual_covariance_seconds=time.perf_counter()-started)
 
     def _science_measurement_cross(self, sampling, field):
+        if getattr(self, "device", None) is not None:
+            started=time.perf_counter()
+            return self.device.to_host(self.device.crosses(field)[0]), time.perf_counter()-started
         started = time.perf_counter(); beta = self.native.ao.src.direction[:, field]
         cross = np.zeros((len(sampling.xs), self.nc*self.nv))
         values = np.empty((2, len(sampling.xs), self.nv))
@@ -571,9 +577,17 @@ class FiniteApertureReconstructor:
         """Return the same physical residual as factors and bounded covariance blocks."""
         self.prepare_optics(sampling,dense_source=False)
         started = time.perf_counter()
-        cross,query_seconds = self._science_measurement_cross(sampling,field)
+        device=getattr(self, 'device', None)
+        if device is not None and hasattr(self, 'common_basis'):
+            before=time.perf_counter()
+            cross=device.common_context(field)
+            query_seconds=time.perf_counter()-before
+            operator=self.common_basis
+        else:
+            cross,query_seconds = self._science_measurement_cross(sampling,field)
+            operator=self.operator
         independent = _stationary_terms(self._independent_power(field),self.aux_kernels,sampling,sampling.n)
         residual = FiniteResidualCovariance(sampling,self.source_terms,self.correction,
-            self.additional_covariance,cross,self.operator,independent)
+            self.additional_covariance,cross,operator,independent)
         return residual,dict(science_measurement_seconds=query_seconds,
             residual_covariance_seconds=time.perf_counter()-started)

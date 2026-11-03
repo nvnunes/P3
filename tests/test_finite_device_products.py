@@ -112,3 +112,17 @@ def test_global_gpu_arrays_rejected_before_numpy_operations():
     native = SimpleNamespace(freq=SimpleNamespace(kxAO_=object()))
     with pytest.raises(ValueError,match='P3_DISABLE_GPU=1'):
         validate_native(native)
+
+
+def test_failed_single_stage_cuda_preparation_is_not_cached(tmp_path,monkeypatch):
+    from p3.aoSystem import finiteTwoStageCupy
+    native=coupled_model(tmp_path/'case',enabled=False,covariance_backend='cuda')
+    sample=sampling(native);backend=native._finite_aperture_backend();attempts=[]
+    def unavailable(*args):
+        attempts.append(True)
+        raise RuntimeError('unavailable test device')
+    monkeypatch.setattr(finiteTwoStageCupy,'CupyFiniteProducts',unavailable)
+    for _ in range(2):
+        with pytest.raises(RuntimeError,match='unavailable test device'):
+            backend.prepare_optics(sample,dense_source=False)
+    assert len(attempts)==2

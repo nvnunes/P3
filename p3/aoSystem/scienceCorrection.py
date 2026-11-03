@@ -80,9 +80,10 @@ def configuration(config, model):
 
 
 def covariance_backend(value, model, science):
-    """Validate execution policy; GPU products currently accelerate two-stage finite optics."""
+    """Validate execution policy; CUDA supports finite optics; Metal requires active two-stage correction."""
     if not isinstance(value, str) or value not in ('numpy', 'cuda', 'mps'):
         raise ValueError("finiteApertureBackend must be 'numpy', 'cuda' or 'mps'")
-    if value != 'numpy' and (model != 'finite_aperture' or science is None or not science.active):
-        raise ValueError(f'finiteApertureBackend={value} requires active finite-aperture science correction')
+    if value != 'numpy' and (model != 'finite_aperture' or
+            (value == 'mps' and (science is None or not science.active))):
+        raise ValueError(f'finiteApertureBackend={value} requires finite_aperture; Metal additionally requires active science correction')
     return value

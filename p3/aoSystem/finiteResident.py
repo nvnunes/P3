@@ -81,6 +81,12 @@ class ResidentCovariance:
             base=base.base
         if not isinstance(base,FiniteResidualCovariance):
             raise TypeError('Resident covariance requires the native finite residual')
+        # Two-stage device fields already include both common cross terms.
+        self.base_cross = not any(getattr(term, 'includes_base_cross', False) for term in self.terms)
+        if self.base_cross:
+            operator=(owner.common_operator if base.operator is getattr(owner.backend, 'common_basis', None)
+                      else owner.upload(base.operator))
+            self.terms.append((operator, -owner.upload(base.cross)))
         digest=_background_digest(base)
         cached=owner._resident_background
         if cached is None or not cached.matches(base,digest):
@@ -149,4 +155,6 @@ class ResidentCovariance:
                 extra-=2*((weight@device.common)*(weight@self.owner.common_operator)).sum()
                 quadratic+=float(self.owner.to_host(extra))
             base=base.base
+        if self.base_cross:
+            quadratic-=2*np.dot(intensity@base.cross, intensity@base.operator)
         return float(intensity@self.residual.diagonal-quadratic)

@@ -47,9 +47,13 @@ def test_regularization_is_explicit_nonnegative_number(value):
 def test_numerical_backend_is_api_scoped(backend):
     stage,_=configuration(sections(),'finite_aperture')
     assert covariance_backend(backend,'finite_aperture',stage)==backend
-    for value,model,science in [('typo','finite_aperture',stage),(backend,'finite_aperture',None),
+    for value,model,science in [('typo','finite_aperture',stage),
                                 (backend,'alias_aware',stage)]:
         with pytest.raises(ValueError):covariance_backend(value,model,science)
+    if backend == 'cuda':
+        assert covariance_backend(backend,'finite_aperture',None) == backend
+    else:
+        with pytest.raises(ValueError):covariance_backend(backend,'finite_aperture',None)
     with pytest.raises(ValueError,match='finite_aperture'):
         configuration({'sensor_HO':{'ReconstructionRegularization':.1}},'alias_aware')
 
@@ -221,5 +225,5 @@ def test_disabling_science_revalidates_numerical_backend_scope(tmp_path):
     value = coupled_model(tmp_path/'case')
     value.finiteApertureBackend = 'mps'
     value.my_data_map['RTC_science']['LoopGain_HO'] = 0.
-    with pytest.raises(ValueError, match='active finite-aperture'):
+    with pytest.raises(ValueError, match='Metal additionally requires active'):
         value._finite_aperture_backend()

@@ -15,10 +15,11 @@ class DeviceFiniteProducts:
         self.backend, self.sampling = backend, sampling
         self.query = backend._science_query
         self.common_rows = self.upload(backend.weights)
-        self.common_operator = self.upload(backend.common_basis)
-        self.feedback = self.upload(backend.feedback)
-        self.cbb = self.upload(backend.cbb)
-        self.common_cross = self.upload(backend.common_science_cross)
+        self.common_operator = self.upload(getattr(backend, "common_basis", backend.operator))
+        if getattr(backend.native, "twoStageEnabled", False):
+            self.feedback = self.upload(backend.feedback)
+            self.cbb = self.upload(backend.cbb)
+            self.common_cross = self.upload(backend.common_science_cross)
         self.ramps = self.upload(sampling.ramps)
         self.blocks = [(y, self.upload(points, integer=True), self.upload(indices, integer=True))
             for y,points,indices in self.query.blocks]
@@ -39,9 +40,11 @@ class DeviceFiniteProducts:
             cache.move_to_end(layer)
             return cache[layer][0]
         stats['misses']+=1
-        pair=(self.upload(self.backend.interpolation[layer].host_phase()),
-              self.upload(self.backend.raw_interpolation[layer].host_phase()))
-        size=sum(value.numel()*value.element_size() if hasattr(value,'numel') else value.nbytes for value in pair)
+        filtered=self.upload(self.backend.interpolation[layer].host_phase())
+        raw=getattr(self.backend, "raw_interpolation", None)
+        pair=(filtered, self.upload(raw[layer].host_phase()) if raw is not None else filtered)
+        unique={id(value): value for value in pair}.values()
+        size=sum(value.numel()*value.element_size() if hasattr(value,'numel') else value.nbytes for value in unique)
         limit=stats['limit_bytes']
         if size<=limit:
             while cache and stats['resident_bytes']+size>limit:
@@ -55,7 +58,9 @@ class DeviceFiniteProducts:
         """Release host phase only when every layer can stay device-resident."""
         if self._pinned_kernel_pairs is not None:
             return True
-        families=(self.backend.interpolation,self.backend.raw_interpolation)
+        families=(self.backend.interpolation,)
+        if hasattr(self.backend, "raw_interpolation"):
+            families+=(self.backend.raw_interpolation,)
         dtype=np.dtype(getattr(self,'host_covariance_dtype',np.float64))
         required=sum(layer.host_phase().size*dtype.itemsize for family in families for layer in family)
         if required>self.kernel_cache_info['limit_bytes']:
@@ -141,6 +146,10 @@ class DeviceFiniteProducts:
             del filtered,raw
         return result
 
+    def common_context(self, field):
+        """Contract all measurement channels into exact common-mirror commands."""
+        return self.to_host(self.crosses(field)[0]@self.common_rows.T)
+
     def context(self, crosses, science_rows, science_basis):
         """Retain exact command-space factors for both physical mirrors."""
         common = crosses[0]@self.common_rows.T
@@ -153,6 +162,9 @@ class DeviceFiniteProducts:
 
 
 class _DeviceField:
+    # The common science/correction terms are included in block_array/variance.
+    includes_base_cross = True
+
     def __init__(self,owner,common,operator,update):
         self.owner,self.common,self.operator,self.update = owner,common,operator,update
 

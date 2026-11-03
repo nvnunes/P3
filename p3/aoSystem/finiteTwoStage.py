@@ -75,14 +75,6 @@ class FiniteTwoStageReconstructor(FiniteActuatorReconstructor):
             self.stage.gain**2*c00,self.stage.gain**2*self.cov_raw,c12,c1_12,
             self.stage.gain**2*c10,self.feedback)
 
-    def _common_correction_covariance(self):
-        # Metal builds the complete resident background once. CPU/CUDA keep
-        # their dense cache to avoid repeated factor products during optics.
-        if self.array_backend=='mps':
-            commands=(self.weights@self.cov_raw)@self.weights.T
-            return CommandCovariance(self.common_basis,commands)
-        return super()._common_correction_covariance()
-
     def prepare_optics(self,sampling,dense_source=True):
         super().prepare_optics(sampling,dense_source)
         if sampling.n!=sampling.native_n:
@@ -130,7 +122,7 @@ class FiniteTwoStageReconstructor(FiniteActuatorReconstructor):
     def directional_preparation(self,fields):
         """Return a scoped CPU producer for ordered, unique configured fields.
 
-        The Metal prediction thread consumes the rows during this context.
+        The device prediction thread consumes the rows during this context.
         Immutable inputs, one prediction consumer and no concurrent reporting
         queries are required. Exit joins the producer, including on failure.
         """

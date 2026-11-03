@@ -89,8 +89,9 @@ class fourierModel:
         ----------
         finiteApertureBackend : str, optional
             Numerical covariance products: "numpy" (default), "cuda" or "mps".
-            GPU products require active finite-aperture science correction.
-            CUDA uses CuPy float64 on the current device; Metal uses float32.
+            CUDA supports single- and two-stage finite aperture in CuPy float64
+            on the current device. Metal uses float32 and requires active
+            finite-aperture science correction.
             This is not an INI physics setting. Reconstruction solves remain
             CPU double precision; set P3_DISABLE_GPU=1 before importing P3.
         path_ini : str
@@ -819,8 +820,9 @@ class fourierModel:
     def _layer_temporal_frequencies(self, qx, qy):
         """Frozen-flow frequency in Hz, with independent layers on the last axis."""
         angle = np.asarray(self.ao.atm.wDir)*np.pi/180
-        vx = self.ao.atm.wSpeed*np.cos(angle)
-        vy = self.ao.atm.wSpeed*np.sin(angle)
+        speed = np.asarray(self.ao.atm.wSpeed)
+        vx = speed*np.cos(angle)
+        vy = speed*np.sin(angle)
         return -(qx[..., None]*vx+qy[..., None]*vy)
 
     def _wfs_grid_phases(self):
@@ -1230,7 +1232,7 @@ class fourierModel:
         if self.temporalModel == 'polc':
             frequency = self._layer_temporal_frequencies(self.freq.kxAO_, self.freq.kyAO_)
             response = self._polc_response(frequency)
-            weights = self.sensedWeights/max(self.sensedWeights.sum(), nnp.finfo(float).tiny)
+            weights = np.asarray(self.sensedWeights/max(self.sensedWeights.sum(), nnp.finfo(float).tiny))
             self.h1 = np.sum(weights*response, axis=-1)
             self.h2 = np.sum(weights*abs(response)**2, axis=-1)
             self.hn = self.h2.copy()
@@ -1856,8 +1858,8 @@ class fourierModel:
             raise ValueError('Paired spectra require piston_filter=True')
         d, T, td, vx, vy, weights, _, _, tf, kx, ky, mx, my = self._aliasing_common()
         k = np.hypot(kx, ky)
-        ux = np.divide(kx, k, out=np.zeros_like(kx), where=k > 0)
-        uy = np.divide(ky, k, out=np.zeros_like(ky), where=k > 0)
+        ux = np.where(k > 0, kx/np.where(k > 0, k, 1), 0)
+        uy = np.where(k > 0, ky/np.where(k > 0, k, 1), 0)
         estimator = self.W[:, :, 0, :].reshape(-1, self.W.shape[-1])
         offsets = np.asarray(self.my_data_map.get('sensor_HO', {}).get('GridOffsets',
                              [[0., 0.]]*self.nGs), dtype=self.dtype)
@@ -2132,7 +2134,7 @@ class fourierModel:
             covariance = self.Cphi
             if not piston_filter or optical_pair:
                 pf = self.freq.pistonFilterAO_[..., None]
-                optical_covariance = np.divide(self.Cphi, pf, out=np.zeros_like(self.Cphi), where=pf > 0)
+                optical_covariance = np.where(pf > 0, self.Cphi/np.where(pf > 0, pf, 1), 0)
                 if not piston_filter:
                     covariance = optical_covariance
         if self.nGs < 2:

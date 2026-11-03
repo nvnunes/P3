@@ -47,3 +47,19 @@ def test_resident_covariance_retains_all_updates_and_reuses_background(tmp_path,
     base.source_terms=(base.source_terms[0]+.01,*base.source_terms[1:])
     third=backend.device.resident_covariance(again)
     assert third.background is not second.background
+
+
+@pytest.mark.parametrize('means',[False,True])
+def test_single_stage_resident_keeps_science_cross_terms(tmp_path,means):
+    native=coupled_model(tmp_path/'case',False);native.removeMeanSlopes=means
+    sample=sampling(native);b=native._finite_aperture_backend()
+    residual,_=b.residual_blocks(sample,0)
+    owner=HostProducts(b,sample)
+    resident=owner.resident_covariance(residual)
+    quadratic=0.
+    for first,expected in residual.blocks(rows=13):
+        np.testing.assert_allclose(resident.block_array(first,first+len(expected)),expected,rtol=2e-11,atol=2e-11)
+        upper=np.arange(first,len(residual.diagonal))[None]>=np.arange(first,first+len(expected))[:,None]
+        weighted=expected*sample.intensity[first:first+len(expected),None]*sample.intensity[None,first:]
+        quadratic+=2*weighted[upper].sum()-np.sum(np.diag(expected[:,:len(expected)])*sample.intensity[first:first+len(expected)]**2)
+    np.testing.assert_allclose(resident.variance(),sample.intensity@residual.diagonal-quadratic,rtol=2e-11,atol=2e-11)
