@@ -96,6 +96,23 @@ def _periodic_cubic_matrix(coordinates, size):
         np.arange(0, 4*len(start)+1, 4)), shape=(len(start), size))
 
 
+class _LayerInterpolation:
+    """Separately owned phase and float64 fitted-tilt covariance coefficients.
+
+    A device owner may release ``phase`` after pinning the complete coefficient
+    set. Fit moments always stay on the host; CPU and cache-evicting paths retain
+    phase too. Separate allocations make releasing phase reclaim actual storage.
+    """
+    def __init__(self,grid):
+        self.phase=np.empty((2,grid,grid))
+        self.fit=np.empty((2,2,grid,grid))
+
+    def host_phase(self):
+        if self.phase is None:
+            raise RuntimeError('Phase coefficients belong to the pinned device cache; rebuild the backend for CPU execution')
+        return self.phase
+
+
 class _ScienceMeasurementQuery:
     """Separable cubic queries at pupil-minus-contracted-lenslet positions.
 
@@ -112,6 +129,7 @@ class _ScienceMeasurementQuery:
         self.cx, ix = np.unique(cells[:, 0], return_inverse=True)
         self.cy, iy = np.unique(cells[:, 1], return_inverse=True)
         self.grid, self.scale = grid, grid/period
+        self.grouped_query_stats=dict(calls=0,requested_y_products=0,computed_y_products=0)
         nx = len(self.x)*len(self.cx)
         rows = max(1, (32*1024**2)//(8*len(self.cy)*(2*grid+nx)))
         self.blocks = []
@@ -135,6 +153,36 @@ class _ScienceMeasurementQuery:
                 values = mx@intermediate.T
                 output[axis, points] = values.ravel()[indices]
 
+    def evaluate_group(self,kernels,origins,contraction,output):
+        """Reuse exactly identical y operators across a bounded guide group.
+
+        Output is ``(slope axis, guide, pupil point, lenslet)``. Grouping compares
+        complete sparse coefficients; close but unequal operators stay separate.
+        No directions or covariance weights are rounded or averaged.
+        """
+        matrices=[]
+        for origin in origins:
+            x=(self.x[:,None]+(origin[0]-contraction*self.cx[None]))*self.scale
+            matrices.append(_periodic_cubic_matrix(x,self.grid))
+        stats=self.grouped_query_stats
+        stats['calls']+=1
+        for y,points,indices in self.blocks:
+            groups={}
+            for guide,origin in enumerate(origins):
+                coordinates=(y[:,None]+(origin[1]-contraction*self.cy[None]))*self.scale
+                matrix=_periodic_cubic_matrix(coordinates,self.grid)
+                key=(matrix.indices.tobytes(),matrix.data.tobytes())
+                groups.setdefault(key,(matrix,[]))[1].append(guide)
+            stats['requested_y_products']+=len(kernels)*len(origins)
+            stats['computed_y_products']+=len(kernels)*len(groups)
+            for matrix,guides in groups.values():
+                for axis in range(len(kernels)):
+                    intermediate=np.ascontiguousarray((matrix@kernels[axis]).T)
+                    for guide in guides:
+                        values=matrices[guide]@intermediate
+                        output[axis,guide,points]=values.ravel()[indices]
+                    del intermediate
+
 
 class FiniteResidualCovariance:
     """One field's complete residual, evaluated in bounded upper row strips.
@@ -152,6 +200,8 @@ class FiniteResidualCovariance:
         self.cross = cross; self.operator = operator
         # Pupil fitting is linear. Sum stationary moments before projection,
         # retaining the complete incoming source without a dense source matrix.
+        self.source_terms=source
+        self.independent_terms=independent
         self.lags, self.points, self.tilt = (a+b for a,b in zip(source,independent))
         ramps = sampling.ramps
         diagonal = np.full(len(sampling.xs), self.lags[0,0])
@@ -400,6 +450,10 @@ class FiniteApertureReconstructor:
             if abs(values.imag).max() > 2e-7: raise ValueError('Non-real finite-aperture command surface')
             self.operator[:, sl] = values.real-sampling.ramps.T@(moments@w).real
 
+    def _common_correction_covariance(self):
+        """Return complete common covariance for this backend's optical cache."""
+        return (self.operator@self.cov_raw)@self.operator.T
+
     def prepare_optics(self, sampling, dense_source=True):
         """Prepare/cache correction and science covariance for one optical grid."""
         key = (sampling.n, sampling.native_n, sampling.native_side, sampling.period, sampling.signature)
@@ -411,7 +465,7 @@ class FiniteApertureReconstructor:
             raise ValueError('Finite-aperture optics and reconstruction must share the physical Fourier period')
         self.kernels = sampling.tilt_moments(self.count, self.period)
         self._prepare_common_operator(sampling)
-        self.correction = (self.operator@self.cov_raw)@self.operator.T
+        self.correction = self._common_correction_covariance()
         self.source_terms = _stationary_terms(self.raw.sum(0)*self.dk**2, self.kernels, sampling, sampling.n)
         tail_started = time.perf_counter()
         self.atmospheric_tail = AtmosphericTail(self.native.ao.atm.r0,
@@ -441,12 +495,13 @@ class FiniteApertureReconstructor:
         self.kernel_grid = 2**int(np.ceil(np.log2(max(self.count, 4*self.native_n))))
         self.interpolation = []
         for layer in range(len(self.heights)):
-            values = np.empty((3, 2, self.kernel_grid, self.kernel_grid))
+            values = _LayerInterpolation(self.kernel_grid)
             for j in range(2):
                 base = self.raw[layer]*self.dk**2*self.gradients[layer, j].conj()*self.temporal[layer].conj()
                 for i, multiplier in enumerate((1, self.kernels[0], self.kernels[1])):
                     c = fft.ifft2(_fold(base*multiplier, self.kernel_grid)).real*self.kernel_grid**2
-                    values[i, j] = ndimage.spline_filter(c, order=3, mode='grid-wrap')
+                    plane=values.phase[j] if i==0 else values.fit[i-1,j]
+                    plane[:] = ndimage.spline_filter(c, order=3, mode='grid-wrap')
             self.interpolation.append(values)
         self.aux_kernels = sampling.tilt_moments(self.native_n, self.period)
         auxiliary = np.real(self.native.differentialRefractionPSD()+self.native.chromatismPSD())
@@ -500,9 +555,9 @@ class FiniteApertureReconstructor:
                 origin = h*(beta-self.guide[guide])-a*self.offsets[guide]
                 cx = origin[0]-a*self.cells[:, 0]; cy = origin[1]-a*self.cells[:, 1]
                 base = np.array([cy, cx])*self.kernel_grid/self.period
-                self._science_query.evaluate(kernel[0], origin, a, values)
+                self._science_query.evaluate(kernel.host_phase(), origin, a, values)
                 for j in range(2):
-                    fit = np.array([ndimage.map_coordinates(kernel[i, j], base, order=3, mode='grid-wrap', prefilter=False) for i in (1, 2)])
+                    fit = np.array([ndimage.map_coordinates(kernel.fit[i,j], base, order=3, mode='grid-wrap', prefilter=False) for i in range(2)])
                     values[j] -= sampling.ramps.T@fit
                     cross[:, (2*guide+j)*self.nv:(2*guide+j+1)*self.nv] += values[j]
         return cross,time.perf_counter()-started

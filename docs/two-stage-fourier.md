@@ -65,6 +65,39 @@ products on the current CUDA device; `'mps'` selects optional PyTorch Metal
 float32 products. Both use the same periodic cubic queries and covariance
 factorization. Reconstruction and shared solves remain CPU float64.
 
+Metal retains bounded layer-kernel caches, batches two science directions and
+evaluates complete mean-slope feedback streams on device when complex FFTs are
+available. Otherwise that feedback contraction stays on CPU. P3 exposes resident
+covariance tiles to TIPTOP's pupil-pair coherence integrator; the ordinary host
+covariance API remains available for diagnostics. Each backend/sampling instance
+owns its caches and directional factors. No covariance term is removed.
+
+Where the optional Metal shader API is available, cubic queries evaluate valid
+pupil/lenslet pairs directly rather than materializing rectangular intermediates.
+Coordinates remain float64 and device products float32; missing shader support
+retains the existing Torch Metal query calculation. Small-output shared temporal and feedback Fourier
+transforms use equivalent complex128 matrix products without changing bandwidth
+or normalization. Both paths preserve physical frequencies before Fourier folding.
+
+Phase-kernel and fitted-tilt coefficient storage have separate owners. If all
+Metal phase kernels fit the resident budget, they are pinned and duplicate host
+phase planes are released; float64 fit moments remain. Cache-evicting and CPU/CUDA
+paths retain their host phase planes. Changing the backend rebuilds its state.
+Metal retains common covariance in exact command-space factors until its complete
+resident optical background is assembled; CPU/CUDA keep dense covariance caches.
+Directional CPU prior queries reuse only identical sparse interpolation operators
+and the direction-independent zero-height contribution. Backend lifetime owns
+these caches; no coordinate rounding or changed reconstruction is introduced.
+
+For multi-direction Metal prediction, a scoped single CPU producer prepares
+complete float64 directional science weights while the prediction thread runs
+device propagation and optics. At most two direction batches remain live. Device
+calls and field consumption stay serial; exit cancels queued work and joins the
+producer, including on failure. Inputs must remain immutable during prediction.
+CPU/CUDA and optional error-budget queries keep serial preparation. Forward
+reporting views cannot consume another backend's pending weights. No physical
+setting, reconstruction component or covariance term changes.
+
 Set `P3_DISABLE_GPU=1` before importing P3/TIPTOP: its global GPU array mode is
 separate and incompatible with finite reconstruction. This does not disable the
 explicit finite-aperture device products. Keep the selected CUDA device current
@@ -90,3 +123,12 @@ available and `P3_DISABLE_GPU=1`, `MASTSEL_DISABLE_GPU=1`.
 cache selection and explicit unavailable-device failures. Hardware parity tests
 in `test_finite_two_stage.py` and `test_gaussian_mirrors.py` require the selected
 CUDA or Metal device; unavailable hardware is reported as a skip.
+`tests/test_finite_resident.py` and TIPTOP's `tests/test_finite_device_optics.py`
+check complete resident covariance, feedback fallback, optical integration,
+direction batching and cache isolation using host tensor algebra. Native Metal
+PSF parity and cold complete-workload benchmarks are separate hardware checks.
+`tests/test_finite_mps_queries.py` compares fused queries with the Torch and
+float64 periodic interpolation, skipping when the optional Metal API is absent.
+`tests/test_finite_memory.py` and the device-product tests check pinned/small-cache
+ownership, exact covariance factors, unchanged dense CPU/CUDA behavior and exact
+CPU prior-query reuse.

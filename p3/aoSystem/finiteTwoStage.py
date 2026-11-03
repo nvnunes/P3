@@ -10,12 +10,12 @@ from scipy import fft, ndimage
 from scipy.linalg import cho_solve
 
 from .finiteAperture import (FiniteResidualCovariance,
-                             _fold, _stationary_terms)
+                             _fold, _stationary_terms, _LayerInterpolation)
 
 from .finiteActuator import FiniteActuatorReconstructor
 from .mirrorSurface import GaussianSurface
 from .finiteCovariance import (
-    _fourier_sum_many, CoupledFiniteResidual, residual_stream_moments,
+    _fourier_sum_many, CoupledFiniteResidual, residual_stream_moments, CommandCovariance,
 )
 
 
@@ -75,6 +75,14 @@ class FiniteTwoStageReconstructor(FiniteActuatorReconstructor):
             self.stage.gain**2*c00,self.stage.gain**2*self.cov_raw,c12,c1_12,
             self.stage.gain**2*c10,self.feedback)
 
+    def _common_correction_covariance(self):
+        # Metal builds the complete resident background once. CPU/CUDA keep
+        # their dense cache to avoid repeated factor products during optics.
+        if self.array_backend=='mps':
+            commands=(self.weights@self.cov_raw)@self.weights.T
+            return CommandCovariance(self.common_basis,commands)
+        return super()._common_correction_covariance()
+
     def prepare_optics(self,sampling,dense_source=True):
         super().prepare_optics(sampling,dense_source)
         if sampling.n!=sampling.native_n:
@@ -85,12 +93,13 @@ class FiniteTwoStageReconstructor(FiniteActuatorReconstructor):
         self.science_basis=self.fitted_surface(self.science_surface,sampling)
         self.raw_interpolation = []
         for layer in range(len(self.heights)):
-            values = np.empty((3,2,self.kernel_grid,self.kernel_grid))
+            values = _LayerInterpolation(self.kernel_grid)
             for j in range(2):
                 density = self.raw[layer]*self.dk**2*self.gradients[layer,j].conj()
                 for i,multiplier in enumerate((1,self.kernels[0],self.kernels[1])):
                     c = fft.ifft2(_fold(density*multiplier,self.kernel_grid)).real*self.kernel_grid**2
-                    values[i,j] = ndimage.spline_filter(c,order=3,mode='grid-wrap')
+                    plane=values.phase[j] if i==0 else values.fit[i-1,j]
+                    plane[:] = ndimage.spline_filter(c,order=3,mode='grid-wrap')
             self.raw_interpolation.append(values)
         if self.array_backend=='cuda':
             from .finiteTwoStageCupy import CupyFiniteProducts
@@ -101,6 +110,32 @@ class FiniteTwoStageReconstructor(FiniteActuatorReconstructor):
         else: self.device = None
         self._coupled_sampling = self._sampling
         self.timings['coupled_optical_preparation_seconds'] = time.perf_counter()-started
+
+    def prepare_science_rows(self,fields):
+        """Prepare configured field indices without device calls.
+
+        Return an ordered mapping ``field: (float64 command/slopes rows, seconds)``.
+        Inputs belong to this immutable reconstruction backend; the caller must
+        serialize prior queries because their exact zero-height cache is shared.
+        Each returned array belongs to its field and retains every command mode.
+        """
+        result={}
+        for field in fields:
+            tick=time.perf_counter()
+            target=self.science_surface.fit@self._prior_cross(field)
+            rows=cho_solve(self.factor,target.T,check_finite=False).T
+            result[int(field)]=(rows,time.perf_counter()-tick)
+        return result
+
+    def directional_preparation(self,fields):
+        """Return a scoped CPU producer for ordered, unique configured fields.
+
+        The Metal prediction thread consumes the rows during this context.
+        Immutable inputs, one prediction consumer and no concurrent reporting
+        queries are required. Exit joins the producer, including on failure.
+        """
+        from .finitePipeline import DirectionalPreparation
+        return DirectionalPreparation(self,fields,self.device.direction_batch_size)
 
     def science_operator(self, sampling, field):
         """Fit the directional phase estimate to the science actuator surface."""
@@ -123,10 +158,10 @@ class FiniteTwoStageReconstructor(FiniteActuatorReconstructor):
                     (0,self.interpolation[layer],origin,1.),
                     (1,self.raw_interpolation[layer],origin-shift,self.stage.gain),
                     (2,self.interpolation[layer],origin-shift,self.stage.gain)):
-                    self._science_query.evaluate(kernel[0],offset,a,values)
+                    self._science_query.evaluate(kernel.host_phase(),offset,a,values)
                     base = np.array([offset[1]-a*self.cells[:,1],offset[0]-a*self.cells[:,0]])*self.kernel_grid/self.period
                     for axis in range(2):
-                        fit = np.array([ndimage.map_coordinates(kernel[i,axis],base,order=3,mode='grid-wrap',prefilter=False) for i in (1,2)])
+                        fit = np.array([ndimage.map_coordinates(kernel.fit[i,axis],base,order=3,mode='grid-wrap',prefilter=False) for i in range(2)])
                         values[axis] -= sampling.ramps.T@fit
                         cross[stream,:,(2*guide+axis)*self.nv:(2*guide+axis+1)*self.nv] += gain*values[axis]
         return cross
@@ -136,8 +171,10 @@ class FiniteTwoStageReconstructor(FiniteActuatorReconstructor):
         started = time.perf_counter(); before = time.perf_counter()
         crosses = self._query_crosses(sampling,field)
         query_seconds = time.perf_counter()-before; before = time.perf_counter()
-        target=self.science_surface.fit@self._prior_cross(field)
-        rows=cho_solve(self.factor,target.T,check_finite=False).T
+        preparation=getattr(self,'_directional_preparation',None)
+        if preparation is None or preparation.backend is not self:
+            rows,preparation_seconds=self.prepare_science_rows((field,))[field]
+        else:rows,preparation_seconds=preparation.take(field)
         basis=self.science_basis
         operator=basis@rows if self.device is None else None
         operator_seconds = time.perf_counter()-before
@@ -158,8 +195,9 @@ class FiniteTwoStageReconstructor(FiniteActuatorReconstructor):
             self.additional_covariance,common,common_operator,independent)
         residual = CoupledFiniteResidual(base,operator,update,device)
         profile=dict(science_measurement_seconds=query_seconds,
-            science_operator_seconds=operator_seconds,residual_covariance_seconds=time.perf_counter()-started)
-        return self._project_measurement_means(residual,sampling,field,profile)
+            science_operator_seconds=operator_seconds,science_rows_cpu_seconds=preparation_seconds,
+            science_rows_pipelined=preparation is not None and preparation.backend is self,residual_covariance_seconds=time.perf_counter()-started)
+        return self._project_measurement_means(residual,sampling,field,profile,science_rows=rows)
 
     def residual_covariance(self,sampling,field):
         residual,profile = self.residual_blocks(sampling,field)

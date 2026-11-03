@@ -41,6 +41,7 @@ class FiniteActuatorReconstructor(FiniteApertureReconstructor):
         self.prior_grid=2**int(np.ceil(np.log2(max(self.count,4*self.native_n))))
         self.prior_query=_ScienceMeasurementQuery(surface.fit_points,self.cells,self.prior_grid,self.period)
         self.prior_interpolation=None
+        self._zero_height_prior={}
 
     def _prior_kernel(self,layer,multiplier=1):
         values=[]
@@ -57,8 +58,14 @@ class FiniteActuatorReconstructor(FiniteApertureReconstructor):
 
     def _prior_cross(self,field=None,average=False):
         cross=np.zeros((len(self.phase_fit_points),self.nc*self.nv))
-        values=np.empty((2,len(self.phase_fit_points),self.nv))
+        # Bound grouped output to 32 MiB, or one guide if it exceeds that.
+        # The averaged common estimator keeps its original summation order.
+        group=1 if average else max(1,min(self.ng,(32*1024**2)//(16*len(self.phase_fit_points)*self.nv)))
+        values=np.empty((2,group,len(self.phase_fit_points),self.nv))
         for layer,(a,h) in enumerate(zip(self.contraction,self.heights)):
+            if not average and h==0 and layer in self._zero_height_prior:
+                cross+=self._zero_height_prior[layer]
+                continue
             if average:
                 phase=np.zeros_like(self.qx,dtype=complex)
                 for beta,weight in zip(self.targets,self.target_weights):
@@ -68,11 +75,21 @@ class FiniteActuatorReconstructor(FiniteApertureReconstructor):
             else:
                 kernel=self.prior_interpolation[layer]
                 beta=self.native.ao.src.direction[:,field]
-            for guide in range(self.ng):
-                origin=h*(beta-self.guide[guide])-a*self.offsets[guide]
-                self.prior_query.evaluate(kernel,origin,a,values)
-                for axis in range(2):
-                    cross[:,(2*guide+axis)*self.nv:(2*guide+axis+1)*self.nv]+=values[axis]
+            target=np.zeros_like(cross) if not average and h==0 else cross
+            for first in range(0,self.ng,group):
+                last=min(first+group,self.ng)
+                origins=h*(beta-self.guide[first:last])-a*self.offsets[first:last]
+                if last-first==1:
+                    self.prior_query.evaluate(kernel,origins[0],a,values[:,0])
+                else:
+                    self.prior_query.evaluate_group(kernel,origins,a,values[:,:last-first])
+                for local,guide in enumerate(range(first,last)):
+                    for axis in range(2):
+                        cross_channel=slice((2*guide+axis)*self.nv,(2*guide+axis+1)*self.nv)
+                        target[:,cross_channel]+=values[axis,local]
+            if not average and h==0:
+                self._zero_height_prior[layer]=target
+                cross+=target
         return cross
 
     def _prepare_common_operator(self,sampling):
@@ -100,14 +117,17 @@ class FiniteActuatorReconstructor(FiniteApertureReconstructor):
         self.timings['common_feedback_seconds'] = time.perf_counter()-started
         return feedback
 
-    def _project_measurement_means(self,residual,sampling,field,profile):
+    def _project_measurement_means(self,residual,sampling,field,profile,science_rows=None):
         if not self.native.removeMeanSlopes:return residual,profile
         if not hasattr(self,'projected_feedback'):
             from .finiteMeanSlopes import ProjectedFeedback
             if not hasattr(self,'feedback'):self.feedback=self._common_feedback()
             self.projected_feedback=ProjectedFeedback(self)
             self.timings['measurement_projection_seconds']=self.projected_feedback.seconds
-        return self.projected_feedback.wrap(residual,sampling,field),profile
+        started=time.perf_counter()
+        result=self.projected_feedback.wrap(residual,sampling,field,science_rows=science_rows)
+        profile=dict(profile,measurement_projection_field_seconds=time.perf_counter()-started)
+        return result,profile
 
     def residual_blocks(self,sampling,field):
         residual,profile=super().residual_blocks(sampling,field)

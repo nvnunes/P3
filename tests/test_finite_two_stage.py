@@ -161,3 +161,16 @@ def test_field_residual_owns_directional_arrays_and_reuses_shared_state(tmp_path
     for (i,expected),(j,actual) in zip(snapshot,first.blocks(19)):
         assert i==j
         np.testing.assert_array_equal(actual,expected)
+
+
+@pytest.mark.parametrize('count,size',[(31,7),(32,7),(32,16)])
+def test_batched_fourier_preserves_complex_finite_sum(count,size):
+    rng=np.random.default_rng(17)
+    spectra=rng.normal(size=(4,count,count))+1j*rng.normal(size=(4,count,count))
+    start=np.array([-.73,.84]);dk=.13;step=.19
+    frequency=(np.arange(count)-count//2)*dk
+    positions=start[:,None]+np.arange(size)[None]*step
+    transforms=np.exp(2j*np.pi*positions[:,:,None]*frequency[None,None])
+    expected=np.array([transforms[0]@s@transforms[1].T for s in spectra])
+    actual=_fourier_sum_many(spectra,dk,start,step,size)
+    np.testing.assert_allclose(actual,expected,rtol=2e-11,atol=2e-11)

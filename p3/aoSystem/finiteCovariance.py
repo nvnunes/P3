@@ -6,9 +6,40 @@ import numpy as np
 from scipy import signal
 
 
+class CommandCovariance:
+    """Complete pupil covariance in exact mirror-command factors.
+
+    ``basis`` is shared read-only with the backend. Only ``basis @ covariance``
+    is allocated here; blocks and the diagonal retain every command component.
+    This is an algebraic factorization, with no rank or covariance truncation.
+    """
+    def __init__(self,basis,covariance):
+        self.basis=basis
+        self.product=basis@covariance
+        self.shape=(len(basis),len(basis))
+
+    @property
+    def nbytes(self):
+        """Owned factor bytes, excluding the shared optical basis."""
+        return self.product.nbytes
+
+    def diagonal(self):
+        return np.einsum('ij,ij->i',self.product,self.basis)
+
+    def __getitem__(self,key):
+        rows,columns=key
+        return self.product[rows]@self.basis[columns].T
+
+
 def _fourier_sum_many(spectra, dk, start, step, size):
-    """One existing finite Fourier sum with a leading moment batch."""
+    """Finite Fourier sum; exact rectangular products for small output grids."""
     count = spectra.shape[-1]
+    if count >= 4*size:
+        # Exact finite sum at a small output grid; avoid padded CZT arrays.
+        frequency=(np.arange(count)-count//2)*dk
+        positions=np.asarray(start)[:,None]+np.arange(size)[None]*step
+        transform=np.exp(2j*np.pi*positions[:,:,None]*frequency[None,None])
+        return (transform[0]@spectra)@transform[1].T
     j = np.arange(count)
     z = spectra*np.exp(2j*np.pi*j*dk*start[0])[None, :, None]
     z = z*np.exp(2j*np.pi*j*dk*start[1])[None, None, :]

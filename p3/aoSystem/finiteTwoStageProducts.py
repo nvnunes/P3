@@ -1,6 +1,7 @@
 """Shared device arithmetic for finite two-stage optical covariance."""
 import numpy as np
 from scipy import ndimage
+from collections import OrderedDict
 
 
 class DeviceFiniteProducts:
@@ -21,6 +22,61 @@ class DeviceFiniteProducts:
         self.ramps = self.upload(sampling.ramps)
         self.blocks = [(y, self.upload(points, integer=True), self.upload(indices, integer=True))
             for y,points,indices in self.query.blocks]
+        self._resident_background = None
+        self._kernel_cache = OrderedDict()
+        self._pinned_kernel_pairs = None
+        self.kernel_cache_info = dict(hits=0,misses=0,resident_bytes=0,
+                                     limit_bytes=getattr(self,'kernel_cache_bytes',0))
+
+    def kernel_pair(self,layer):
+        """Reuse immutable sampling-owned kernels within an explicit device budget."""
+        cache=self._kernel_cache;stats=self.kernel_cache_info
+        if self._pinned_kernel_pairs is not None:
+            stats['hits']+=1
+            return self._pinned_kernel_pairs[layer]
+        if layer in cache:
+            stats['hits']+=1
+            cache.move_to_end(layer)
+            return cache[layer][0]
+        stats['misses']+=1
+        pair=(self.upload(self.backend.interpolation[layer].host_phase()),
+              self.upload(self.backend.raw_interpolation[layer].host_phase()))
+        size=sum(value.numel()*value.element_size() if hasattr(value,'numel') else value.nbytes for value in pair)
+        limit=stats['limit_bytes']
+        if size<=limit:
+            while cache and stats['resident_bytes']+size>limit:
+                _,(_,removed)=cache.popitem(last=False)
+                stats['resident_bytes']-=removed
+            cache[layer]=(pair,size)
+            stats['resident_bytes']+=size
+        return pair
+
+    def pin_kernel_pairs(self):
+        """Release host phase only when every layer can stay device-resident."""
+        if self._pinned_kernel_pairs is not None:
+            return True
+        families=(self.backend.interpolation,self.backend.raw_interpolation)
+        dtype=np.dtype(getattr(self,'host_covariance_dtype',np.float64))
+        required=sum(layer.host_phase().size*dtype.itemsize for family in families for layer in family)
+        if required>self.kernel_cache_info['limit_bytes']:
+            return False
+        pairs=tuple(self.kernel_pair(i) for i in range(len(self.backend.heights)))
+        released=0
+        for family in families:
+            for layer in family:
+                released+=layer.phase.nbytes
+                layer.phase=None
+        self._pinned_kernel_pairs=pairs
+        self.kernel_cache_info.update(pinned_layers=len(pairs),released_host_bytes=released)
+        return True
+
+    def resident_covariance(self,residual):
+        """Keep complete covariance tiles on this device, with owner-bound caches."""
+        from .finiteResident import ResidentCovariance
+        return ResidentCovariance(self,residual)
+
+    def copy(self,array):
+        return array.copy()
 
     def upload(self, array, integer=False):
         """Copy a host array into device-owned floating or integer storage."""
@@ -66,10 +122,8 @@ class DeviceFiniteProducts:
         for layer,(a,h) in enumerate(zip(b.contraction,b.heights)):
             angle = np.deg2rad(b.native.ao.atm.wDir[layer])
             shift = b.native.ao.atm.wSpeed[layer]*b.stage.delay/rate*np.array([np.cos(angle),np.sin(angle)])
-            # Upload one pair of axis kernels at a time. Host fit-moment
-            # kernels remain float64, as in the CPU path; no duplicate atlas.
-            filtered = self.upload(b.interpolation[layer][0])
-            raw = self.upload(b.raw_interpolation[layer][0])
+            # Host fit moments retain float64; device kernels are sampling-owned.
+            filtered,raw = self.kernel_pair(layer)
             for guide in range(b.ng):
                 origin = h*(beta-b.guide[guide])-a*b.offsets[guide]
                 for stream,kernel,device_kernel,offset,gain in (
@@ -78,8 +132,8 @@ class DeviceFiniteProducts:
                     (2,b.interpolation[layer],filtered,origin-shift,b.stage.gain)):
                     self.evaluate(device_kernel,offset,a,values)
                     base = np.array([offset[1]-a*b.cells[:,1],offset[0]-a*b.cells[:,0]])*b.kernel_grid/b.period
-                    fit = np.array([[ndimage.map_coordinates(kernel[i,axis],base,order=3,
-                        mode='grid-wrap',prefilter=False) for i in (1,2)] for axis in range(2)])
+                    fit = np.array([[ndimage.map_coordinates(kernel.fit[i,axis],base,order=3,
+                        mode='grid-wrap',prefilter=False) for i in range(2)] for axis in range(2)])
                     corrected = values-(self.ramps.T@self.upload(fit))
                     for axis in range(2):
                         channel = slice((2*guide+axis)*b.nv,(2*guide+axis+1)*b.nv)
@@ -111,7 +165,11 @@ class _DeviceField:
                      (self.operator, self.update, self.owner.common_operator, self.common))
 
     def block(self,first,last):
+        return self.owner.to_host(self.block_array(first,last))
+
+    def block_array(self,first,last):
+        """Return the same device tile without a host synchronization."""
         o1=self.owner.common_operator; o2=self.operator; d=self.update; x=self.common
         value = d[first:last]@o2[first:].T+o2[first:last]@d[first:].T
         value -= x[first:last]@o1[first:].T+o1[first:last]@x[first:].T
-        return self.owner.to_host(value)
+        return value

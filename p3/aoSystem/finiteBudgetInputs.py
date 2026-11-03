@@ -9,22 +9,8 @@ from copy import copy
 import numpy as np
 from scipy import fft, ndimage
 
-from .finiteAperture import _fold, _stationary_terms
-from .finiteCovariance import _fourier_sum_many, residual_stream_moments
-
-
-class _CommandCovariance:
-    """Common covariance in command factors, avoiding another dense pupil array."""
-    def __init__(self, basis, covariance):
-        self.basis = basis
-        self.product = basis @ covariance
-
-    def diagonal(self):
-        return np.einsum('ij,ij->i', self.product, self.basis)
-
-    def __getitem__(self, key):
-        rows, columns = key
-        return self.product[rows] @ self.basis[columns].T
+from .finiteAperture import _fold, _stationary_terms, _LayerInterpolation
+from .finiteCovariance import _fourier_sum_many, residual_stream_moments, CommandCovariance
 
 
 def _measurement_moments(b, crop, power):
@@ -112,7 +98,7 @@ def band_view(b, sampling):
     if b.native.removeMeanSlopes:
         low.projected_feedback = _projected_moments(b, crop, power)
         low.projected_feedback.b = low
-    low.correction = _CommandCovariance(b.common_basis, b.weights@low.cov_raw@b.weights.T)
+    low.correction = CommandCovariance(b.common_basis, b.weights@low.cov_raw@b.weights.T)
     low.source_terms = _stationary_terms(power.sum(0), b.kernels[:, crop, crop], sampling, sampling.n)
     low._source_covariance = None
     low.auxiliary = np.zeros_like(b.auxiliary)
@@ -125,11 +111,12 @@ def band_view(b, sampling):
         if b.native.twoStageEnabled:
             targets.append((low.raw_interpolation, 1.))
         for target, control in targets:
-            values = np.empty((3, 2, b.kernel_grid, b.kernel_grid))
+            values = _LayerInterpolation(b.kernel_grid)
             for axis in range(2):
                 density = power[layer]*b.gradients[layer, axis, crop, crop].conj()*control
                 for i, multiplier in enumerate((1., b.kernels[0, crop, crop], b.kernels[1, crop, crop])):
                     covariance = fft.ifft2(_fold(density*multiplier, b.kernel_grid)).real*b.kernel_grid**2
-                    values[i, axis] = ndimage.spline_filter(covariance, order=3, mode='grid-wrap')
+                    plane=values.phase[axis] if i==0 else values.fit[i-1,axis]
+                    plane[:] = ndimage.spline_filter(covariance, order=3, mode='grid-wrap')
             target.append(values)
     return low

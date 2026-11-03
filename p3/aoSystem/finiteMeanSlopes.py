@@ -7,8 +7,20 @@ import time
 import numpy as np
 from scipy import fft
 
-from .finiteAperture import _fold
 from .finiteCovariance import _fourier_sum_many, CoupledFiniteResidual
+
+
+def _fold_many(spectra,n):
+    """The same physical Fourier folding with a bounded leading stream batch."""
+    count=spectra.shape[-1]
+    index=(np.arange(count)-count//2)%n
+    result=np.zeros((len(spectra),n,n),complex)
+    for first in range(0,count,n):
+        last=min(first+n,count)
+        for other in range(0,count,n):
+            end=min(other+n,count)
+            result[:,index[None,other:end],index[first:last,None]]+=spectra[:,first:last,other:end]
+    return result
 
 
 def row_response(backend, rows, layer):
@@ -72,35 +84,77 @@ class ProjectedFeedback:
             self.covariance+=((zr*pr)@zr.conj().T).real
             for guide in range(b.ng):
                 shift=a*b.offsets[guide]+h*b.guide[guide]
+                start=shift-a*b.pitch*(b.ncell-1)/2
+                transform=None
+                # Small target grids favor exact rectangular float64 products.
+                if b.count>=4*b.ncell:
+                    positions=start[:,None]+np.arange(b.ncell)[None]*a*b.pitch
+                    spatial_frequency=(np.arange(b.count)-b.count//2)*b.dk
+                    transform=np.exp(2j*np.pi*positions[:,:,None]*spatial_frequency[None,None])
                 for axis in range(2):
                     channel=2*guide+axis
                     base=power*b.gradients[layer,axis]*z.conj()
                     for stream,multiplier in enumerate((h1,h2,h1*h2)):
-                        values=_fourier_sum_many(base*multiplier,b.dk,
-                            shift-a*b.pitch*(b.ncell-1)/2,a*b.pitch,b.ncell).real
+                        if transform is None:
+                            values=_fourier_sum_many(base*multiplier,b.dk,
+                                start,a*b.pitch,b.ncell).real
+                        else:
+                            values=(transform[0]@(base*multiplier)@transform[1].T).real
                         index=np.rint(b.cells/b.pitch+(b.ncell-1)/2).astype(int)
                         self.cross[stream,channel*b.nv:(channel+1)*b.nv]+=values[:,index[:,0],index[:,1]].T
+        self.projected_feedback=self.feedback_means-self.means@(self.means.T@self.feedback_means)
+        self.science_cross=self.cross[1]-b.feedback@self.cross[2]
+        self._cross_owner=self.cross
+        self._optics_sampling=None
+        self._optics_operator=None
         self.seconds=time.perf_counter()-started
 
-    def wrap(self,residual,sampling,field):
+    def wrap(self,residual,sampling,field,science_rows=None):
         """Return a field-owned symmetric update of the original covariance."""
         b=self.b
-        science=(b.science_operator(sampling,field) if self.science_gain else np.zeros_like(b.operator))
-        projected_feedback=self.feedback_means-self.means@(self.means.T@self.feedback_means)
-        operator=np.concatenate((b.operator@self.means,science@self.means,
-                                 -science@projected_feedback),axis=1)
-        old_cross=b.operator@self.cross[0]+science@(self.cross[1]-b.feedback@self.cross[2])
+        # Input-band reporting views copy this object but own new cross moments.
+        changed=self._cross_owner is not self.cross
+        if changed:
+            self.science_cross=self.cross[1]-b.feedback@self.cross[2]
+            self._cross_owner=self.cross
+        if changed or self._optics_sampling is not sampling or self._optics_operator is not b.operator:
+            self._common_means=b.operator@self.means
+            self._common_cross=b.operator@self.cross[0]
+            self._optics_sampling=sampling
+            self._optics_operator=b.operator
+        if self.science_gain:
+            if science_rows is None:
+                from scipy.linalg import cho_solve
+                target=b.science_surface.fit@b._prior_cross(field)
+                science_rows=cho_solve(b.factor,target.T,check_finite=False).T
+            basis=b.science_basis
+            science_means=basis@(science_rows@self.means)
+            science_feedback=basis@(science_rows@self.projected_feedback)
+            old_cross=self._common_cross+basis@(science_rows@self.science_cross)
+        else:
+            science_means=np.zeros_like(self._common_means)
+            science_feedback=np.zeros_like(self._common_means)
+            old_cross=self._common_cross
+        operator=np.concatenate((self._common_means,science_means,-science_feedback),axis=1)
+        device=getattr(b,'device',None)
+        if (device is not None and hasattr(device,'projected_atmosphere')
+                and getattr(device,'complex_feedback_supported',True)):
+            atmospheric=device.projected_atmosphere(self,sampling,field)
+            update=old_cross-atmospheric+.5*operator@self.covariance
+            return CoupledFiniteResidual(residual,operator,update)
         atmospheric=np.zeros_like(operator)
         beta=b.native.ao.src.direction[:,field]
         ys=(sampling.ys-sampling.n//2)%sampling.n
         xs=(sampling.xs-sampling.n//2)%sampling.n
+        kernels=b.kernels.reshape(len(b.kernels),-1)
         for layer,h in enumerate(b.heights):
             phase=np.exp(2j*np.pi*h*(b.qx*beta[0]+b.qy*beta[1]))
-            power=b.raw[layer]*b.dk**2
-            for col,z in enumerate(self.layers[layer]):
-                density=power*phase*z.conj()
-                values=fft.ifft2(_fold(density,sampling.n)).real*sampling.n**2
-                moments=np.sum(b.kernels*density[None],axis=(1,2)).real
-                atmospheric[:,col]+=values[ys,xs]-sampling.ramps.T@moments
+            weighted=b.raw[layer]*b.dk**2*phase
+            for first in range(0,len(self.layers[layer]),6):
+                last=min(first+6,len(self.layers[layer]))
+                density=weighted[None]*self.layers[layer][first:last].conj()
+                values=fft.ifft2(_fold_many(density,sampling.n),axes=(-2,-1)).real*sampling.n**2
+                moments=(kernels@density.reshape(len(density),-1).T).real
+                atmospheric[:,first:last]+=values[:,ys,xs].T-sampling.ramps.T@moments
         update=old_cross-atmospheric+.5*operator@self.covariance
         return CoupledFiniteResidual(residual,operator,update)
