@@ -20,11 +20,12 @@ from p3.aoSystem.FourierUtils import (
 
 class TestFourierUtils(unittest.TestCase):
     def test_fwhm_boundary_profiles_return_the_available_width(self):
-        for values in ([1, .8, .2, .1, .2, .8, 1],
-                       [1, 1, .8, .2, .1], [.1, .2, .8, 1, 1]):
+        for values, width in (([1, .8, .2, .1, .2, .8, 1], 6.0),
+                              ([1, 1, .8, .2, .1], 2.5),
+                              ([.1, .2, .8, 1, 1], 2.5)):
             with self.subTest(profile=values):
                 profile = np.asarray(values, dtype=float)
-                self.assertEqual(fwhm_1d(profile), profile.size)
+                self.assertAlmostEqual(fwhm_1d(profile), width)
 
     def test_fwhm_interior_crossings_are_unchanged(self):
         profile = np.asarray([.1, .2, .8, 1, .8, .2, .1])
